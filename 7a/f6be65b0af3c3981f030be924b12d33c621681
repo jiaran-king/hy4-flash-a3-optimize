@@ -1,0 +1,27 @@
+patches/optimize/08-fused-small-decode/README.md
+  s_61b688964f46ae::t_d23d3b4b8e8fa5 1-18
+patches/optimize/08-fused-small-decode/fuse-hy4-indexpool-quant.patch
+  s_61b688964f46ae::t_42e7ad3b915cd8 1-116
+patches/optimize/08-fused-small-decode/fuse-hy4-paged-decode.patch
+  s_61b688964f46ae::t_2fc54fa999d58b 1-240
+patches/optimize/08-fused-small-decode/fuse-hy4-small-batch-ihc.patch
+  s_61b688964f46ae::t_d0a7024e96b000 1-148
+patches/optimize/08-fused-small-decode/reuse-hy4-step-index-metadata.patch
+  s_61b688964f46ae::t_28230f9a5dc19d 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7af6be65b0af3c3981f030be924b12d33c621681",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
