@@ -1,0 +1,21 @@
+patches/optimize/01-batch-paged-decode/README.md
+  s_61b688964f46ae::t_a00045d8511cee 1-15
+patches/optimize/01-batch-paged-decode/batch-paged-decode.patch
+  s_61b688964f46ae::t_45b72d20c88455 1-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f5f76840f8cbebe6f9a09e0132d0f8cf79ecaadd",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
