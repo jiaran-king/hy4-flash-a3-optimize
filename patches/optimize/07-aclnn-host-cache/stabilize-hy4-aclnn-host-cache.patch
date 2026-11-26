@@ -1,0 +1,40 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/device/hardware_profile.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/device/hardware_profile.py
+index 37502c2..8d7f2ec 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/device/hardware_profile.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/device/hardware_profile.py
+@@ -304,6 +304,9 @@ class HardwareProfile:
+     # retains native dispatch; this is a stack workaround, not a silicon limit.
+     gdn_fixed_spec_recurrent_fallback_min_query_len: int | None = None
+ 
++    # Long eager HY4 prefill can pressure the per-thread CANN executor cache.
++    hy4_eager_aclnn_cache_limit: int | None = None
++
+     def supports(self, capability: HardwareCapability) -> bool:
+         """Return whether the exact documented ``capability`` contract is available."""
+ 
+@@ -400,6 +403,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
+         ),
+         AscendDeviceType.A3: HardwareProfile(
+             _device_type=AscendDeviceType.A3,
++            hy4_eager_aclnn_cache_limit=100_000,
+             attention_backend_family=AttentionBackendFamily.STANDARD,
+             cpu_binding_mode=CPUBindingMode.GLOBAL_SLICE,
+             default_worker_cls=_DEFAULT_WORKER_CLS,
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/platform.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/platform.py
+index 089b163..2785447 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/platform.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/platform.py
+@@ -657,6 +657,13 @@ class NPUPlatform(Platform):
+             logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
+             return
+ 
++        model_config = vllm_config.model_config
++        if model_config.enforce_eager and getattr(model_config.hf_text_config, "model_type", None) == "hy_v4_flash":
++            cache_limit = get_current_hardware_profile().hy4_eager_aclnn_cache_limit
++            if cache_limit is not None:
++                limit = os.environ.setdefault("ACLNN_CACHE_LIMIT", str(cache_limit))
++                logger.info_once("HY4 Flash eager sets ACLNN_CACHE_LIMIT=%s before worker startup.", limit)
++
+         # vLLM #61392 folds `compress_ratios` into `layer_types`/`compress_rates`.
+         # Restore the legacy field before any runner/model/cache component reads
+         # it (e.g. NPUModelRunner.__init__ setting `use_compress`).
