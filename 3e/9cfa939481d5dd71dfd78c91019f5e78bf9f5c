@@ -1,0 +1,21 @@
+patches/optimize/02-query-chunk-128/README.md
+  s_61b688964f46ae::t_0a36cfdf88be5a 1-15
+patches/optimize/02-query-chunk-128/query-chunk-128-on-batch-decode.patch
+  s_61b688964f46ae::t_4e76c68c0f37e4 1-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3e9cfa939481d5dd71dfd78c91019f5e78bf9f5c",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
