@@ -1,0 +1,21 @@
+patches/optimize/05-batched-indexpool-decode/README.md
+  s_61b688964f46ae::t_ee85a3d30607a8 1-15
+patches/optimize/05-batched-indexpool-decode/batch-indexpool-decode.patch
+  s_61b688964f46ae::t_6b6ffc90db23bc 1-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b5cd457ad81420c79835c4d620f7c716b9556407",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
