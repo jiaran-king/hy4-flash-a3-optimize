@@ -1,0 +1,80 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -12,17 +12,19 @@
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.models.hy_v4_flash.nvidia.indexpool_ops import (
+     INDEX_DIM,
+-    expand_groups,
+     fwht_scaled,
+     gated_pool,
+     rotate_indexer,
+-    select_groups,
+ )
+ 
+ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
+ from vllm_ascend.models.hy_v4_flash_a3 import attend_paged_with_sink
+ from vllm_ascend.models.hy_v4_flash_a3_fp8 import round_e4m3fn
++from vllm_ascend.models.hy_v4_flash_a3_indexpool import (
++    expand_ordered_groups,
++    select_ordered_groups,
++)
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+ 
+ _SCORE_CHUNK_SIZE = 128
+@@ -151,11 +153,11 @@
+             if keys.shape[0] > self.group_budget:
+                 projected = q.reshape(-1, INDEX_DIM).float() @ keys.float().T
+                 scores = (projected.view(q.shape[0], self.num_heads, -1).float().relu_() * w[..., None]).sum(1)
+-                chosen = select_groups(scores, pos // self.ratio, self.group_budget)
++                chosen = select_ordered_groups(scores, pos // self.ratio, self.group_budget)
+             else:
+                 # Every complete group fits in the selection budget.
+                 chosen = torch.arange(self.group_budget, device=q.device, dtype=torch.int32).expand(q.shape[0], -1)
+-            output.append(expand_groups(chosen, pos, self.ratio))
++            output.append(expand_ordered_groups(chosen, pos, self.ratio))
+         return torch.cat(output)
+ 
+     def forward(self, hidden, q_c, positions):
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
+@@ -0,0 +1,39 @@
++# SPDX-License-Identifier: Apache-2.0
++"""IndexPool group ordering and token expansion for the Ascend A3 path."""
++
++import torch
++import torch.nn.functional as F
++
++
++def select_ordered_groups(logits, upper, budget):
++    groups = logits.shape[1]
++    # FP32 can represent each eligible group id and the sentinel exactly.
++    if groups > 2**24:
++        from vllm.models.hy_v4_flash.nvidia.indexpool_ops import select_groups
++
++        return select_groups(logits, upper, budget)
++
++    columns = torch.arange(groups, device=logits.device)
++    scores = logits.masked_fill(columns[None] >= upper[:, None], -torch.inf)
++    count = min(budget, groups)
++    values, indices = scores.topk(count, dim=-1)
++    # Sorting integer indices falls back to AICPU on A3.
++    ordered = torch.where(values != -torch.inf, indices, groups).float().sort(dim=-1).values
++    ordered.masked_fill_(ordered == groups, -1)
++    return F.pad(ordered.int(), (0, budget - count), value=-1)
++
++
++def expand_ordered_groups(group_ids, positions, ratio):
++    """Expand a prefix of ascending history ids and append the causal tail."""
++    offsets = torch.arange(ratio, dtype=torch.int32, device=group_ids.device)
++    upper = positions // ratio
++    live = positions >= 0
++    valid = (group_ids >= 0) & (group_ids < upper[:, None]) & live[:, None]
++    history = (group_ids[..., None] * ratio + offsets).masked_fill(~valid[..., None], -1)
++    tail = upper[:, None] * ratio + offsets
++    tail = tail.masked_fill(~live[:, None] | (tail > positions[:, None]), -1).int()
++    tail_start = valid.sum(dim=-1, dtype=torch.int32) * ratio
++    destinations = (tail_start[:, None] + offsets).long()
++    # Ordered groups leave their invalid entries at the end. Only the tail moves.
++    padded = F.pad(history.flatten(1), (0, ratio), value=-1)
++    return padded.scatter_(1, destinations, tail)
