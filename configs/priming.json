@@ -1,0 +1,25 @@
+{
+  "primed": [
+    {
+      "requests": 1,
+      "input_tokens": 16384,
+      "output_tokens": 16
+    },
+    {
+      "requests": 4,
+      "input_tokens": 16384,
+      "output_tokens": 16
+    },
+    {
+      "requests": 4,
+      "input_tokens": 16384,
+      "output_tokens": 128
+    }
+  ],
+  "prompt_sha256": [
+    "314a0306de1a0e6fef05eebe9c5f7cb17a5d9bc5dff1007b47c93126b42af8fa",
+    "98eaaeb64cfa407daf2dcc5de61a0806ec5ec90df4b0af316f49bb0551ecae0d",
+    "4cfd40aa4e74584faa2873e8d35abd9a0369ddc7b463bcdf7b704f6fe6090e77",
+    "26af0f6663de183cb9db48a8566163a2ab9daf3c86d175042979135a1d751a74"
+  ]
+}

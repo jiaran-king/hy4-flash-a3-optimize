@@ -1,0 +1,43 @@
+{
+  "suite": "hy4-flash-a3-accuracy",
+  "sources": {
+    "gsm8k": "3101c7d5072418e28b9008a6636bde82a006892c",
+    "lm_eval": "27988a293647d5853e48edea291640b4af54740c",
+    "ruler": "db43f92ff634bbce1c33d1fb15858aec4bba509a"
+  },
+  "service": {
+    "model": "hy4-flash",
+    "model_max_tokens": 17408,
+    "reasoning_effort": "no_think",
+    "temperature": 0,
+    "seed": 619421,
+    "device_count": 16
+  },
+  "gsm8k": {
+    "task": "gsm8k_cot",
+    "few_shot": 8,
+    "docs": 1319,
+    "screen_docs": 128,
+    "screen_seed": "hy4-flash-a3-gsm8k-v1",
+    "concurrency": 16,
+    "max_tokens": 512,
+    "score": "flexible-extract",
+    "reported_filters": [
+      "strict-match",
+      "flexible-extract"
+    ]
+  },
+  "ruler": {
+    "seed": 426117,
+    "input_tokens": 16384,
+    "concurrency": 4,
+    "docs_per_task": 32,
+    "subtasks": {
+      "niah_multivalue": 128,
+      "vt": 30,
+      "cwe": 120
+    },
+    "score": "string_match_all",
+    "source_max_tokens": 16352
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "model": "tencent/Hy4-flash",
+  "served_model": "hy4-flash",
+  "scenario": "single-node-16k-input-1k-output",
+  "input_tokens": 16384,
+  "output_tokens": 1024,
+  "model_max_tokens": 17408,
+  "tensor_parallel_size": 16,
+  "expert_parallel": true,
+  "dtype": "bfloat16",
+  "kv_cache_dtype": "bfloat16",
+  "kv_cache_bytes_per_die": 8589934592,
+  "max_batch_tokens": 2048,
+  "max_sequences": 16,
+  "prefix_caching": false,
+  "seed": 20261124,
+  "temperature": 0,
+  "request_rate": "inf",
+  "first_scan": [
+    {
+      "concurrency": 1,
+      "requests": 3
+    },
+    {
+      "concurrency": 2,
+      "requests": 5
+    },
+    {
+      "concurrency": 4,
+      "requests": 9
+    }
+  ]
+}

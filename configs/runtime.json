@@ -1,0 +1,46 @@
+{
+  "sources": {
+    "vllm": {
+      "revision": "4092096fef1fb0b1fcda9e1bc697b72e5eb55522",
+      "archive": "vllm-4092096f.tar.gz",
+      "archive_url": "https://codeload.github.com/vllm-project/vllm/tar.gz/4092096fef1fb0b1fcda9e1bc697b72e5eb55522",
+      "sha256": "c864bc99d7341eb79d85e3874c063bd155203f6346bc55ee77b46b6ab1d102a2"
+    },
+    "vllm-ascend": {
+      "revision": "838b6f75d2e1abf10b10fe1f31ff68db748bf18a",
+      "archive": "ascend-838b6f75d.tar.gz",
+      "archive_url": "https://codeload.github.com/vllm-project/vllm-ascend/tar.gz/838b6f75d",
+      "sha256": "4f909211229e37d16e51a749cf308691decaf7168518edab5cb3e07dbacf2612"
+    }
+  },
+  "ascend_integration": {
+    "revision": "9d281a01a6d9084e9694c8e25a753041aee67c8f",
+    "sha256": "3bd226c6445e21c0caac44527f2976445037aaa032c2380431f3cc5d59bb62bb"
+  },
+  "baseline_files": {
+    "vllm/vllm/models/hy_v4_flash/nvidia/indexpool_ops.py": "3dc0039c6926b2a0cf09de5eb5cbe26897c0cb027933bbdd416d3aef267232c7",
+    "vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py": "6e59de358a46876f7fed2b030e7f38a447e981ba1d1912e9fd9b46b8582ccc60",
+    "vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py": "e00032de98987ab88e63dcf343f1a1954e143d03aa212e174437e225d5e0ceeb",
+    "vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_fp8.py": "8b04eaf044733de2536976d2338d70e7c2af1a760b2490bdbde50dead4fb3146"
+  },
+  "reference_image_tag": "atlas-ci-v0.34.0-a3-20261123102928_aarch64",
+  "runtime_versions": {
+    "cann_version": "9.3.0",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post7"
+  },
+  "native_extension": {
+    "file": "vllm_ascend_C.cpython-312-aarch64-linux-gnu.so",
+    "sha256": "18042d7c08a85df694501a94fdb688e3c51acb3e38720d58223fb2420a0c6bef"
+  },
+  "model": {
+    "repository": "tencent/Hy4-flash",
+    "source": "https://huggingface.co/tencent/Hy4-flash/tree/d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959",
+    "config_sha256": "a59ea10f98683e83c6515e340c85e24eb2e48c91d75af491ed3d6e88c3bc1b3c",
+    "index_sha256": "0cd31d2ffceb989e4d465d0c80be5731f6941dbf434ad84506e30930fa02e192",
+    "safetensors_shards": 148,
+    "revision": "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959",
+    "chat_template_sha256": "63ddd5de294df36f10c8f2c8e5f7b2a9dc2011c8481335422f04554256aee4ad",
+    "tokenizer_sha256": "2e3f3d22065c2be5765ce99ab2410411ae338b32ce809ea20dcdb61d00198e83"
+  }
+}
