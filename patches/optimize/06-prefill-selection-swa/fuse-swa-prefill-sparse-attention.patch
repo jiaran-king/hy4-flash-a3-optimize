@@ -1,0 +1,35 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -153,8 +153,20 @@
+             position = torch.arange(first_key, sequence_length, device=query_latent.device)
+             block = block_tables[request].index_select(0, position // block_size).long()
+             slots = block * block_size + position % block_size
+-            latent = flat_latent.index_select(0, slots).float()
+-            rope = flat_rope.index_select(0, slots).float()
++            latent = flat_latent.index_select(0, slots)
++            rope = flat_rope.index_select(0, slots)
++            if native_sparse and request_queries >= QUERY_CHUNK:
++                # Rebase the selection into this request's contiguous KV span.
++                selected = selected_tokens[request_start:request_end]
++                indexes = selected.sub(first_key).clamp_min_(-1)
++                output[request_start:request_end].copy_(_sparse_prefill(
++                    query_latent[request_start:request_end], query_rope[request_start:request_end],
++                    latent[:, None, :], rope[:, None, :], indexes, sinks, scale,
++                ))
++                request_start = request_end
++                continue
++            latent = latent.float()
++            rope = rope.float()
+             for start in range(request_start, request_end, QUERY_CHUNK):
+                 end = min(start + QUERY_CHUNK, request_end)
+                 query = first_query + start - request_start
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -258,6 +258,7 @@
+         topk = _swa_indices(positions, attention.config.sliding_window)
+         if _has_contiguous_logical_positions(context, metadata, positions):
+             shared_window = attention.config.sliding_window
++            native_sparse = True
+     else:
+         topk = attention.indexer(hidden[:tokens], q_c[:tokens], positions)
+         native_sparse = _has_contiguous_logical_positions(context, metadata, positions)

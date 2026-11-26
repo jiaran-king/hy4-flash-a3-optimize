@@ -1,0 +1,14 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -137,8 +137,10 @@
+     native_bmm = query_latent.device.type == "npu" and (
+         query_latent.dtype == query_rope.dtype == latent_cache.dtype == rope_cache.dtype == torch.bfloat16
+     )
++    heads = query_latent.shape[1]
+     native_sparse = (
+-        native_sparse and native_bmm and query_latent.shape[1:] == (2, 512)
++        native_sparse and native_bmm and query_latent.shape[-1] == 512
++        and (heads == 2 or (shared_window > 0 and heads == 4))
+         and query_rope.shape[-1] == 64 and latent_cache.shape[2] == 1
+     )
+     request_start = singletons

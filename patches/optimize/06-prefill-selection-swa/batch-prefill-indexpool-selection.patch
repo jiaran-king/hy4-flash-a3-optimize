@@ -1,0 +1,46 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
+@@ -64,3 +64,22 @@
+     scores = (projected.relu_() * weights[..., None]).sum(1)
+     chosen = select_ordered_groups(scores, positions // ratio, budget, row_widths=group_counts)
+     return expand_ordered_groups(chosen, positions, ratio)
++
++
++def select_prefill_groups(query, weights, keys, positions, ratio, budget, tile_size):
++    queries, heads, dimension = query.shape
++    groups = keys.shape[0]
++    if groups <= budget:
++        chosen = torch.arange(budget, device=query.device, dtype=torch.int32).expand(queries, -1)
++    else:
++        # Bound the per-head score tile, but select and expand the groups once
++        # for the entire prefill span.
++        transposed_keys = keys.float().T
++        scores = torch.empty((queries, groups), device=query.device, dtype=torch.float32)
++        for start in range(0, queries, tile_size):
++            end = min(queries, start + tile_size)
++            projected = query[start:end].reshape(-1, dimension).float() @ transposed_keys
++            weighted = projected.reshape(end - start, heads, groups).relu_() * weights[start:end, :, None]
++            scores[start:end].copy_(weighted.sum(1))
++        chosen = select_ordered_groups(scores, positions // ratio, budget)
++    return expand_ordered_groups(chosen, positions, ratio)
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -26,6 +26,7 @@
+     expand_ordered_groups,
+     select_decode_groups,
+     select_ordered_groups,
++    select_prefill_groups,
+ )
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+ 
+@@ -148,6 +149,10 @@
+         pool_cache[blocks, group_ids % block_size, 0] = pooled
+ 
+     def _select_indices(self, query, weights, keys, positions):
++        if query.shape[0] > _SCORE_CHUNK_SIZE:
++            return select_prefill_groups(
++                query, weights, keys, positions, self.ratio, self.group_budget, _SCORE_CHUNK_SIZE,
++            )
+         output = []
+         for start in range(0, query.shape[0], _SCORE_CHUNK_SIZE):
+             end = start + _SCORE_CHUNK_SIZE
