@@ -1,0 +1,87 @@
+.gitattributes
+  s_61b688964f46ae::t_0433b7da1ff86f 1
+.gitignore
+  s_61b688964f46ae::t_3e57600225e42d 1-5
+LICENSE
+  s_61b688964f46ae::t_04fee8a16d4cb9 1-201
+NOTICE.md
+  s_61b688964f46ae::t_556fe2fbcf2cd0 1-7
+README.md
+  s_61b688964f46ae::t_58b9d3e9a86893 1-22
+bench/accuracy/check_service.py
+  s_61b688964f46ae::t_5beb46e7f0f60b 1-63
+bench/accuracy/check_text.py
+  s_61b688964f46ae::t_9eca4e3620a1bf 1-95
+bench/accuracy/evaluate.py
+  s_61b688964f46ae::t_3ff5c117c13355 1-124
+bench/accuracy/inputs.json
+  s_61b688964f46ae::t_17dc8659574be5 1-571
+bench/accuracy/prepare_inputs.py
+  s_61b688964f46ae::t_2ad2f5fbf83205 1-178
+bench/accuracy/protocol.json
+  s_61b688964f46ae::t_de4e2cf320de3e 1-43
+bench/priming.py
+  s_61b688964f46ae::t_65079383ef528c 1-65
+bench/reduce_measurement.py
+  s_61b688964f46ae::t_979443999827ed 1-148
+bench/report.py
+  s_61b688964f46ae::t_da416a7938b810 1-33
+bench/run_case.py
+  s_61b688964f46ae::t_2c33b2319f8f0c 1-156
+bench/timed_prompts.py
+  s_61b688964f46ae::t_7b43652beb4727 1-55
+configs/baseline.json
+  s_61b688964f46ae::t_314a140a160f91 1-4
+configs/optimized.json
+  s_61b688964f46ae::t_dfa4b75b2e6a8c 1-4
+configs/priming.json
+  s_61b688964f46ae::t_b297524cc074fa 1-25
+configs/runtime.json
+  s_61b688964f46ae::t_149c165910d1ac 1-46
+configs/workload.json
+  s_61b688964f46ae::t_aa2d24660d6d6a 1-33
+deploy/common.py
+  s_61b688964f46ae::t_3eb1fd27f30874 1-79
+deploy/launch_node.py
+  s_61b688964f46ae::t_22777798c4ea23 1-44
+deploy/prepare_runtime.py
+  s_61b688964f46ae::t_48fd852c03c5f9 1-152
+docs/accuracy.md
+  s_61b688964f46ae::t_0a0349b089ea4f 1-29
+docs/benchmark.md
+  s_61b688964f46ae::t_aacb3934cea764 1-34
+docs/optimization.md
+  s_61b688964f46ae::t_d73f3ef89f0a3f 1-18
+patches/a3-baseline/README.md
+  s_61b688964f46ae::t_cb83db3d6eb395 1-5
+patches/a3-baseline/a3_indexpool_fp8.py
+  s_61b688964f46ae::t_21dac06dcf9b3e 1-23
+patches/a3-baseline/a3_sparse_attention.py
+  s_61b688964f46ae::t_77fecd94de31cc 1-59
+patches/a3-baseline/apply_a3_indexpool.py
+  s_61b688964f46ae::t_ed488527e0550b 1-54
+patches/a3-baseline/apply_a3_port.py
+  s_61b688964f46ae::t_be85cac1fbb60a 1-49
+patches/a3-baseline/ascend-integration.patch
+  s_61b688964f46ae::t_2f8d9908b12274 1-3668
+patches/optimize/series
+  s_61b688964f46ae::t_d1af4e20b33a39 1-29
+results/README.md
+  s_61b688964f46ae::t_1b41d4e18fe310 1-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "82dd07fc574b97afefe9564c40712eb6df8f3e29",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
