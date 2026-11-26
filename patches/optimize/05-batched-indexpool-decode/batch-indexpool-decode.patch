@@ -1,0 +1,92 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
+@@ -5,7 +5,7 @@
+ import torch.nn.functional as F
+ 
+ 
+-def select_ordered_groups(logits, upper, budget):
++def select_ordered_groups(logits, upper, budget, *, row_widths=None):
+     groups = logits.shape[1]
+     # FP32 can represent each eligible group id and the sentinel exactly.
+     if groups > 2**24:
+@@ -16,7 +16,13 @@
+     columns = torch.arange(groups, device=logits.device)
+     scores = logits.masked_fill(columns[None] >= upper[:, None], -torch.inf)
+     count = min(budget, groups)
+-    values, indices = scores.topk(count, dim=-1)
++    if row_widths is not None and any(width != groups for width in row_widths):
++        # Matching the original per-request width preserves TopK's tie order.
++        results = [scores[row:row + 1, :width].topk(count, dim=-1)
++                   for row, width in enumerate(row_widths)]
++        values, indices = (torch.cat(parts, dim=0) for parts in zip(*results, strict=True))
++    else:
++        values, indices = scores.topk(count, dim=-1)
+     # Sorting integer indices falls back to AICPU on A3.
+     ordered = torch.where(values != -torch.inf, indices, groups).float().sort(dim=-1).values
+     ordered.masked_fill_(ordered == groups, -1)
+@@ -37,3 +43,24 @@
+     # Ordered groups leave their invalid entries at the end. Only the tail moves.
+     padded = F.pad(history.flatten(1), (0, ratio), value=-1)
+     return padded.scatter_(1, destinations, tail)
++
++
++def decode_group_slots(block_tables, group_counts, block_size):
++    counts = torch.tensor(group_counts, device=block_tables.device)
++    groups = torch.arange(max(group_counts), device=block_tables.device)
++    positions = groups[None, :].expand(counts.numel(), -1)
++    positions = positions.masked_fill(positions >= counts[:, None], 0)
++    pages = block_tables.gather(1, positions // block_size)
++    return pages.long() * block_size + positions % block_size
++
++
++def select_decode_groups(query, weights, pool_cache, slots, positions, group_counts, ratio, budget):
++    # Each row retains its request's page table and causal group boundary.
++    rows, groups = slots.shape
++    dimension = pool_cache.shape[-1]
++    keys = pool_cache.reshape(-1, dimension).index_select(0, slots.flatten())
++    keys = keys.reshape(rows, groups, dimension)
++    projected = torch.bmm(query, keys.transpose(1, 2), out_dtype=torch.float32)
++    scores = (projected.relu_() * weights[..., None]).sum(1)
++    chosen = select_ordered_groups(scores, positions // ratio, budget, row_widths=group_counts)
++    return expand_ordered_groups(chosen, positions, ratio)
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -22,7 +22,9 @@
+ from vllm_ascend.models.hy_v4_flash_a3 import attend_paged_with_sink
+ from vllm_ascend.models.hy_v4_flash_a3_fp8 import round_e4m3fn
+ from vllm_ascend.models.hy_v4_flash_a3_indexpool import (
++    decode_group_slots,
+     expand_ordered_groups,
++    select_decode_groups,
+     select_ordered_groups,
+ )
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+@@ -161,7 +163,8 @@
+         return torch.cat(output)
+ 
+     def forward(self, hidden, q_c, positions):
+-        metadata = get_forward_context().attn_metadata[self.cache.layer_name]
++        context = get_forward_context()
++        metadata = context.attn_metadata[self.cache.layer_name]
+         count = metadata.num_actual_tokens
+         positions = positions[:count]
+         hidden, q_c = hidden[:count], q_c[:count]
+@@ -184,6 +187,18 @@
+         query = self.query_projection(q_c)[0].reshape(-1, self.num_heads, INDEX_DIM)
+         query = _quantized_vectors(rotate_indexer(query, positions, self.rope_dim, self.rope_parameters))
+         weights = self.head_weight_projection(hidden)[0].float() * (self.num_heads * INDEX_DIM) ** -0.5
++        if (query.device.type == "npu" and query.dtype == pool_cache.dtype == torch.bfloat16
++                and count > 1 and count == len(ranges) == len(metadata.seq_lens_list)
++                and min(metadata.seq_lens_list) // self.ratio > self.group_budget):
++            group_counts = tuple(length // self.ratio for length in metadata.seq_lens_list)
++            block_size = pool_cache.shape[1]
++            saved = context.additional_kwargs.setdefault("hy4_decode_indexpool_slots", {})
++            key = (block_tables.data_ptr(), block_tables.stride(), group_counts, block_size)
++            if key not in saved:
++                saved[key] = decode_group_slots(block_tables[:count], group_counts, block_size)
++            return select_decode_groups(
++                query, weights, pool_cache, saved[key], positions, group_counts, self.ratio, self.group_budget,
++            )
+         outputs = []
+         for request, start, end, _, length in ranges:
+             key_positions = torch.arange(length // self.ratio, device=q_c.device)
