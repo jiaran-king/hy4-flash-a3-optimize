@@ -1,0 +1,158 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
+index 7016d17..2bd2a82 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_indexpool.py
+@@ -4,6 +4,11 @@
+ import torch
+ import torch.nn.functional as F
+ 
++from vllm_ascend.ops.triton.hy4_indexpool_small import (
++    expand_small_groups,
++    supports_small_group_expansion,
++)
++
+ 
+ def select_ordered_groups(logits, upper, budget, *, row_widths=None):
+     groups = logits.shape[1]
+@@ -54,7 +59,9 @@ def decode_group_slots(block_tables, group_counts, block_size):
+     return pages.long() * block_size + positions % block_size
+ 
+ 
+-def select_decode_groups(query, weights, pool_cache, slots, positions, group_counts, ratio, budget):
++def select_decode_groups(
++    query, weights, pool_cache, slots, positions, group_counts, ratio, budget, *, use_small_expansion=False,
++):
+     # Each row retains its request's page table and causal group boundary.
+     rows, groups = slots.shape
+     dimension = pool_cache.shape[-1]
+@@ -63,6 +70,8 @@ def select_decode_groups(query, weights, pool_cache, slots, positions, group_cou
+     projected = torch.bmm(query, keys.transpose(1, 2), out_dtype=torch.float32)
+     scores = (projected.relu_() * weights[..., None]).sum(1)
+     chosen = select_ordered_groups(scores, positions // ratio, budget, row_widths=group_counts)
++    if use_small_expansion and supports_small_group_expansion(chosen, positions, ratio):
++        return expand_small_groups(chosen, positions)
+     return expand_ordered_groups(chosen, positions, ratio)
+ 
+ 
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index feb1f59..82ef836 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -34,6 +34,7 @@ from vllm_ascend.ops.triton.hy4_indexpool_quant import (
+     quantize_indexpool_rows,
+     supports_indexpool_quant,
+ )
++from vllm_ascend.ops.triton.hy4_indexpool_small import pool_small_groups, supports_small_pool
+ from vllm_ascend.ops.triton.hy4_paged_decode import supports_paged_kv_write, write_paged_decode_kv
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+ 
+@@ -187,13 +188,17 @@ class AscendHYV4FlashIndexPool(nn.Module):
+             return
+         starts, raw_pages, raw_offsets, pool_pages, pool_offsets = coordinates
+         raw = raw_cache[raw_pages, raw_offsets, 0].float()
+-        pooled = gated_pool(
+-            self.key_value_projection(raw),
+-            self.key_gate_projection(raw),
+-            self.intra_group_ape,
+-            self.key_norm.weight,
+-            self.eps,
+-        ).bfloat16()
++        values = self.key_value_projection(raw)
++        gates = self.key_gate_projection(raw)
++        ape = self.intra_group_ape
++        norm = self.key_norm.weight
++        if (self.use_a3_quant and supports_small_pool(values, norm)
++                and gates.dtype == ape.dtype == torch.float32
++                and gates.shape == values.shape and gates.is_contiguous()
++                and ape.shape == (4, 128) and ape.is_contiguous()):
++            pooled = pool_small_groups(values, gates, ape, norm, self.eps)
++        else:
++            pooled = gated_pool(values, gates, ape, norm, self.eps).bfloat16()
+         pooled = _rotate_indexpool_vectors(
+             context, pooled, starts, self.rope_dim, self.rope_parameters, self.use_a3_quant,
+         )
+@@ -256,6 +261,7 @@ class AscendHYV4FlashIndexPool(nn.Module):
+                 saved[key] = decode_group_slots(block_tables[:count], group_counts, block_size)
+             return select_decode_groups(
+                 query, weights, pool_cache, saved[key], positions, group_counts, self.ratio, self.group_budget,
++                use_small_expansion=self.use_a3_quant,
+             )
+         outputs = []
+         for request, start, end, _, length in ranges:
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_small.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_small.py
+new file mode 100644
+index 0000000..39d0b8d
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_small.py
+@@ -0,0 +1,71 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small-batch IndexPool pooling and causal group expansion on Ascend."""
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def supports_small_pool(values, weights):
++    return (
++        HAS_TRITON and values.device.type == "npu" and values.dtype == weights.dtype == torch.float32
++        and values.ndim == 3 and values.shape[1:] == (4, 128)
++        and weights.shape == (128,) and values.is_contiguous() and weights.is_contiguous()
++        and 0 < values.shape[0] <= 16
++    )
++
++
++@triton.jit
++def _pool_rows(values_ptr, gates_ptr, ape_ptr, norm_ptr, output_ptr, EPS: tl.constexpr):
++    group = tl.program_id(0)
++    token = tl.arange(0, 4)
++    cols = tl.arange(0, 128)
++    coords = token[:, None] * 128 + cols[None, :]
++    values = tl.load(values_ptr + group * 512 + coords)
++    logits = tl.load(gates_ptr + group * 512 + coords) + tl.load(ape_ptr + coords)
++    largest = tl.max(logits, axis=0)
++    exponentials = tl.exp(logits - largest[None, :])
++    weights = exponentials / tl.sum(exponentials, axis=0)[None, :]
++    pooled = tl.sum(values * weights, axis=0)
++    inv_rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / 128 + EPS)
++    normalized = (pooled * inv_rms) * tl.load(norm_ptr + cols)
++    tl.store(output_ptr + group * 128 + cols, normalized)
++
++
++def pool_small_groups(values, gates, ape, norm, eps):
++    output = torch.empty((values.shape[0], 128), dtype=torch.bfloat16, device=values.device)
++    _pool_rows[(values.shape[0],)](values, gates, ape, norm, output, eps, num_warps=4, enable_fp_fusion=False)
++    return output
++
++
++def supports_small_group_expansion(groups, positions, ratio):
++    return (
++        HAS_TRITON and groups.device.type == "npu" and groups.dtype == torch.int32
++        and positions.ndim == 1 and groups.shape[0] == positions.shape[0]
++        and groups.is_contiguous() and positions.is_contiguous()
++        and 0 < groups.shape[0] <= 16 and groups.shape[1] == 511 and ratio == 4
++    )
++
++
++@triton.jit
++def _expand_rows(groups_ptr, positions_ptr, output_ptr):
++    row = tl.program_id(0)
++    position = tl.load(positions_ptr + row).to(tl.int32)
++    upper = position // 4
++    group_lane = tl.arange(0, 512)
++    all_groups = tl.load(groups_ptr + row * 511 + group_lane, group_lane < 511, -1)
++    count = tl.sum(((position >= 0) & (all_groups >= 0) & (all_groups < upper)).to(tl.int32), axis=0)
++    lane = tl.arange(0, 2048)
++    original = tl.load(groups_ptr + row * 511 + lane // 4, lane < 2044, -1)
++    valid = (position >= 0) & (original >= 0) & (original < upper)
++    history = tl.where(valid, original * 4 + lane % 4, -1)
++    displacement = lane - count * 4
++    tail = upper * 4 + displacement
++    tail = tl.where((position >= 0) & (tail <= position), tail, -1)
++    result = tl.where((displacement >= 0) & (displacement < 4), tail, history)
++    tl.store(output_ptr + row * 2048 + lane, result)
++
++
++def expand_small_groups(groups, positions):
++    output = groups.new_empty((groups.shape[0], 2048))
++    _expand_rows[(groups.shape[0],)](groups, positions, output, num_warps=4)
++    return output

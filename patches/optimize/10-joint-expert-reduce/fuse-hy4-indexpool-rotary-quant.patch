@@ -1,0 +1,123 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index 07fc857..feb1f59 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -28,7 +28,12 @@ from vllm_ascend.models.hy_v4_flash_a3_indexpool import (
+     select_ordered_groups,
+     select_prefill_groups,
+ )
+-from vllm_ascend.ops.triton.hy4_indexpool_quant import quantize_indexpool_rows, supports_indexpool_quant
++from vllm_ascend.ops.triton.hy4_indexpool_quant import (
++    indexpool_rotary_frequencies,
++    quantize_indexpool_rotary,
++    quantize_indexpool_rows,
++    supports_indexpool_quant,
++)
+ from vllm_ascend.ops.triton.hy4_paged_decode import supports_paged_kv_write, write_paged_decode_kv
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+ 
+@@ -84,6 +89,19 @@ def _quantized_vectors(vectors, use_a3_quant):
+     return (quantized * scales[:, None]).to(torch.bfloat16).view_as(vectors)
+ 
+ 
++def _rotate_indexpool_vectors(context, vectors, positions, rope_dim, rope_parameters, use_a3_quant):
++    if (use_a3_quant and rope_dim == 64 and positions.ndim == 1 and vectors.is_contiguous()
++            and rope_parameters.get("rope_type", "default") == "default"
++            and supports_indexpool_quant(vectors.view(-1, INDEX_DIM))):
++        theta = rope_parameters.get("rope_theta", 10000.0)
++        cache = context.additional_kwargs.setdefault("hy4_indexpool_rotary_frequencies", {})
++        key = (positions.data_ptr(), positions.shape, positions.stride(), positions.dtype, theta)
++        if key not in cache:
++            cache[key] = indexpool_rotary_frequencies(positions, theta)
++        return quantize_indexpool_rotary(vectors, *cache[key])
++    return _quantized_vectors(rotate_indexer(vectors, positions, rope_dim, rope_parameters), use_a3_quant)
++
++
+ def _swa_indices(positions, window):
+     first = (positions + 1 - window).clamp_min(0)
+     recent = first[:, None] + torch.arange(window, device=positions.device)
+@@ -176,8 +194,8 @@ class AscendHYV4FlashIndexPool(nn.Module):
+             self.key_norm.weight,
+             self.eps,
+         ).bfloat16()
+-        pooled = _quantized_vectors(
+-            rotate_indexer(pooled, starts, self.rope_dim, self.rope_parameters), self.use_a3_quant,
++        pooled = _rotate_indexpool_vectors(
++            context, pooled, starts, self.rope_dim, self.rope_parameters, self.use_a3_quant,
+         )
+         pool_cache[pool_pages, pool_offsets, 0] = pooled
+ 
+@@ -223,8 +241,8 @@ class AscendHYV4FlashIndexPool(nn.Module):
+             return _swa_indices(positions, width)
+ 
+         query = self.query_projection(q_c)[0].reshape(-1, self.num_heads, INDEX_DIM)
+-        query = _quantized_vectors(
+-            rotate_indexer(query, positions, self.rope_dim, self.rope_parameters), self.use_a3_quant,
++        query = _rotate_indexpool_vectors(
++            context, query, positions, self.rope_dim, self.rope_parameters, self.use_a3_quant,
+         )
+         weights = self.head_weight_projection(hidden)[0].float() * (self.num_heads * INDEX_DIM) ** -0.5
+         if (query.device.type == "npu" and query.dtype == pool_cache.dtype == torch.bfloat16
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_quant.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_quant.py
+index 3948665..7a360ae 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_quant.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_quant.py
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Fused small-batch transform and E4M3FN rounding for HY4 IndexPool."""
++"""Fused rotary transform, Hadamard and E4M3FN rounding for HY4 IndexPool."""
+ 
+ import torch
+ from vllm.triton_utils import HAS_TRITON, tl, triton
+@@ -14,10 +14,25 @@ def supports_indexpool_quant(vectors: torch.Tensor) -> bool:
+ 
+ 
+ @triton.jit
+-def _quantize_index_rows(vectors_ptr, output_ptr):
++def _quantize_index_rows(
++    vectors_ptr, output_ptr, cos_ptr, sin_ptr, HEADS: tl.constexpr, ROTARY: tl.constexpr,
++):
+     row = tl.program_id(0)
+     lane = tl.arange(0, 128)
+     values = tl.load(vectors_ptr + row * 128 + lane).to(tl.float32)
++    if ROTARY:
++        token = row // HEADS
++        pair = lane % 32
++        rotary = lane >= 64
++        base = row * 128 + 64 + 2 * pair
++        cosine = tl.load(cos_ptr + token * 32 + pair)
++        sine = tl.load(sin_ptr + token * 32 + pair)
++        left = tl.load(vectors_ptr + base, rotary, 0).to(tl.float32)
++        right = tl.load(vectors_ptr + base + 1, rotary, 0).to(tl.float32)
++        mix_left = left * cosine + (-right) * sine
++        mix_right = right * cosine + left * sine
++        mixed = tl.where(lane < 96, mix_left, mix_right).to(tl.bfloat16).to(tl.float32)
++        values = tl.where(rotary, mixed, values)
+     for step in tl.static_range(0, 7):
+         stride = 1 << step
+         other = tl.gather(values, lane ^ stride, axis=0)
+@@ -49,6 +64,23 @@ def _quantize_index_rows(vectors_ptr, output_ptr):
+ def quantize_indexpool_rows(vectors: torch.Tensor) -> torch.Tensor:
+     output = torch.empty_like(vectors)
+     _quantize_index_rows[(vectors.shape[0],)](
+-        vectors, output, num_warps=4, enable_fp_fusion=False,
++        vectors, output, vectors, vectors, 1, False, num_warps=4, enable_fp_fusion=False,
+     )
+     return output
++
++
++def indexpool_rotary_frequencies(positions, theta):
++    two_steps = torch.arange(0, 64, 2, device=positions.device, dtype=torch.float32)
++    inverse = theta ** (-two_steps / 64)
++    frequency = positions.float()[:, None] * inverse
++    return frequency.cos(), frequency.sin()
++
++
++def quantize_indexpool_rotary(vectors, cosine, sine):
++    heads = vectors.shape[1] if vectors.ndim == 3 else 1
++    rows = vectors.reshape(-1, 128)
++    output = torch.empty_like(rows)
++    _quantize_index_rows[(rows.shape[0],)](
++        rows, output, cosine, sine, heads, True, num_warps=4, enable_fp_fusion=False,
++    )
++    return output.view_as(vectors)

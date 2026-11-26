@@ -1,0 +1,229 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+index dd049e6..739fbc2 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+@@ -11,6 +11,8 @@ Ascend while retaining their checkpoint layout and inherited weight loaders.
+ from copy import deepcopy
+ from typing import Any
+ 
++from dataclasses import dataclass
++
+ import torch
+ import torch_npu
+ from torch import nn
+@@ -43,6 +45,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ 
++from vllm_ascend.ascend_forward_context import uses_hy4_local_expert_decode
+ from vllm_ascend.attention.attention_v1 import (
+     AscendAttentionBackend,
+     AscendAttentionBackendImpl,
+@@ -58,6 +61,7 @@ from vllm_ascend.models.hy_v4_flash_long import (
+     run_paged_sparse_attention,
+ )
+ from vllm_ascend.ops.triton.hy4_ihc_decode import decode_ihc_post, decode_ihc_pre, supports_decode_ihc
++from vllm_ascend.ops.triton.hy4_ihc_handoff import project_decode_ihc_after_update
+ from vllm_ascend.ops.triton.hy4_ihc_project import project_decode_ihc
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
+@@ -392,20 +396,40 @@ class AscendFlashEngram(FlashEngram):
+             set_weight_attrs(projection.bias, {"weight_loader": self._load_bias})
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class _PendingIHCUpdate:
++    output: torch.Tensor
++    residual: torch.Tensor
++    gates: torch.Tensor
++
++    def materialize(self):
++        return decode_ihc_post(self.output, self.residual, self.gates)
++
++
+ class AscendHYV4FlashHCLayer(HYV4HCLayer):
+     def __init__(self, config, layer_idx, prefix):
+         super().__init__(config, layer_idx, prefix=prefix)
+         self.use_a3_ihc = torch.npu.get_device_name().startswith("Ascend910_93")
+ 
++    def _supports_small_pre(self, hidden_states):
++        return (self.use_a3_ihc and self.enable_ihc and self.hc_pre.hpc_op is None
++                and supports_decode_ihc(hidden_states))
++
++    def _plain_projection(self):
++        linear = self.hc_pre.hc_fn
++        weight = linear.weight
++        if (linear.bias is None and weight.dtype == torch.float32
++                and weight.shape == (8, 12288) and weight.is_contiguous()
++                and torch_npu.get_npu_format(weight) == torch_npu.Format.ND):
++            return weight
++        return None
++
+     def pre(self, hidden_states):
+-        if not (self.use_a3_ihc and self.enable_ihc and self.hc_pre.hpc_op is None
+-                and supports_decode_ihc(hidden_states)):
++        if not self._supports_small_pre(hidden_states):
+             return super().pre(hidden_states)
+         pre = self.hc_pre
+-        projection = pre.hc_fn.weight
+-        if (pre.hc_fn.bias is None and projection.dtype == torch.float32
+-                and projection.shape == (8, 12288) and projection.is_contiguous()
+-                and torch_npu.get_npu_format(projection) == torch_npu.Format.ND):
++        projection = self._plain_projection()
++        if projection is not None:
+             reduced, gates = project_decode_ihc(
+                 hidden_states, projection, pre.hc_scale, pre.hc_base,
+                 pre.layernorm_epsilon, pre.hc_eps, pre.magnitude,
+@@ -416,14 +440,29 @@ class AscendHYV4FlashHCLayer(HYV4HCLayer):
+                                             pre.layernorm_epsilon, pre.hc_eps, pre.magnitude)
+         return reduced, gates, hidden_states
+ 
+-    def post(self, output_with_bias, residual, post_gates):
++    def pre_after_update(self, update):
++        projection = self._plain_projection() if self._supports_small_pre(update.residual) else None
++        if projection is None:
++            return self.pre(self.prepare_input(update.materialize()))
++        pre = self.hc_pre
++        return project_decode_ihc_after_update(
++            update.output, update.residual, update.gates, projection, pre.hc_scale,
++            pre.hc_base, pre.layernorm_epsilon, pre.hc_eps, pre.magnitude,
++        )
++
++    def defer_small_update(self, output, residual, gates):
+         if (self.use_a3_ihc and self.enable_ihc and self.hc_post.hpc_op is None
+-                and supports_decode_ihc(residual) and post_gates is not None
+-                and post_gates.dtype == torch.float32 and post_gates.is_contiguous()
+-                and post_gates.shape == residual.shape[:2]
+-                and output_with_bias.dtype == residual.dtype and output_with_bias.is_contiguous()
+-                and output_with_bias.shape == (residual.shape[0], residual.shape[2])):
+-            return decode_ihc_post(output_with_bias, residual, post_gates)
++                and supports_decode_ihc(residual) and gates is not None
++                and gates.dtype == torch.float32 and gates.is_contiguous() and gates.shape == residual.shape[:2]
++                and output.dtype == residual.dtype and output.is_contiguous()
++                and output.shape == (residual.shape[0], residual.shape[2])):
++            return _PendingIHCUpdate(output, residual, gates)
++        return None
++
++    def post(self, output_with_bias, residual, post_gates):
++        update = self.defer_small_update(output_with_bias, residual, post_gates)
++        if update is not None:
++            return update.materialize()
+         return super().post(output_with_bias, residual, post_gates)
+ 
+ 
+@@ -462,11 +501,38 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
+         self.hc_mlp_layer = AscendHYV4FlashHCLayer(config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer")
+ 
+ 
++    def forward(self, positions, hidden_states, residual, *, defer_small_ihc_update=False):
++        if not defer_small_ihc_update:
++            return super().forward(positions, hidden_states, residual)
++
++        attention_hc = self.hc_attn_layer
++        if isinstance(hidden_states, _PendingIHCUpdate):
++            hidden_states, gates, residual = attention_hc.pre_after_update(hidden_states)
++        else:
++            hidden_states, gates, residual = attention_hc.pre(attention_hc.prepare_input(hidden_states))
++        hidden_states = self.input_layernorm(hidden_states)
++        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
++
++        mlp_hc = self.hc_mlp_layer
++        update = attention_hc.defer_small_update(hidden_states, residual, gates)
++        if update is None:
++            hidden_states = attention_hc.post(hidden_states, residual, gates)
++            hidden_states, gates, residual = mlp_hc.pre(mlp_hc.prepare_input(hidden_states))
++        else:
++            hidden_states, gates, residual = mlp_hc.pre_after_update(update)
++        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
++        update = mlp_hc.defer_small_update(hidden_states, residual, gates)
++        if update is not None:
++            return update, None
++        return mlp_hc.post(hidden_states, residual, gates), None
++
++
+ class AscendHYV4FlashModel(HYV4FlashModel):
+     decoder_layer_cls = AscendHYV4FlashDecoderLayer
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         HYV4Model.__init__(self, vllm_config=vllm_config, prefix=prefix)
++        self.use_small_ihc_handoff = vllm_config.model_config.enforce_eager and self.config.enable_ihc
+         self.loaded_parts: dict[str, set[Any]] = {}
+         self.engram_hash = None
+         if self.config.engram_layer_ids:
+@@ -510,11 +576,17 @@ class AscendHYV4FlashModel(HYV4FlashModel):
+             hashes,
+         )
+         hash_indices = {layer_id - 1: index for index, layer_id in enumerate(self.config.engram_layer_ids)}
++        defer_update = (self.use_small_ihc_handoff and 0 < input_ids.numel() <= 4
++                        and positions.shape[-1] == input_ids.numel() and uses_hy4_local_expert_decode())
+         for index, layer in enumerate(self.layers):
+             if index in hash_indices:
++                if isinstance(hidden, _PendingIHCUpdate):
++                    hidden = hidden.materialize()
+                 hidden = layer.hc_attn_layer.prepare_input(hidden)
+                 hidden = layer.engram_layer(hidden, hashes[hash_indices[index]])
+-            hidden, _ = layer(positions, hidden, None)
++            hidden, _ = layer(positions, hidden, None, defer_small_ihc_update=defer_update)
++        if isinstance(hidden, _PendingIHCUpdate):
++            hidden = hidden.materialize()
+         return self.norm(self.hc_head(hidden))
+ 
+     def load_weights(self, weights):
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_handoff.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_handoff.py
+new file mode 100644
+index 0000000..600b2e6
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_handoff.py
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Update iHC residual channels as the following gate projection reads them."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.hy4_ihc_project import _reduce_projected
++
++
++@triton.jit
++def _update_and_project(
++    output_ptr, previous_ptr, gate_ptr, weight_ptr, updated_ptr, partial_ptr,
++    DIM: tl.constexpr, TILE: tl.constexpr,
++):
++    token = tl.program_id(0)
++    split = tl.program_id(1)
++    width: tl.constexpr = 4 * DIM
++    splits: tl.constexpr = width // TILE
++    column = split * TILE + tl.arange(0, TILE)
++    branch = (split * TILE) // DIM
++    output = tl.load(output_ptr + token * DIM + column - branch * DIM).to(tl.float32)
++    previous = tl.load(previous_ptr + token * width + column).to(tl.float32)
++    gate = tl.load(gate_ptr + token * 4 + branch)
++    # The subsequent projection consumes the BF16-rounded residual.
++    updated = (gate * output + previous).to(tl.bfloat16)
++    tl.store(updated_ptr + token * width + column, updated)
++    residual = updated.to(tl.float32)
++    lanes = tl.arange(0, 8)
++    weights = tl.load(weight_ptr + lanes[:, None] * width + column[None, :])
++    projected = tl.sum(residual[None, :] * weights, axis=1)
++    squared = tl.sum(residual * residual, axis=0)
++    partial = partial_ptr + (token * splits + split) * 16
++    tl.store(partial + lanes, projected)
++    tl.store(partial + 8, squared)
++
++
++def project_decode_ihc_after_update(output, previous, gates, weight, scale, base, norm_eps, gate_eps, magnitude):
++    tokens, branches, dim = previous.shape
++    tile = 512
++    splits = branches * dim // tile
++    partial = weight.new_empty((tokens, splits, 16), dtype=torch.float32)
++    updated = torch.empty_like(previous)
++    reduced = previous.new_empty((tokens, dim))
++    post = weight.new_empty((tokens, branches), dtype=torch.float32)
++    _update_and_project[(tokens, splits)](
++        output, previous, gates, weight, updated, partial, dim, tile, num_warps=4, enable_fp_fusion=False,
++    )
++    _reduce_projected[(tokens, dim // tile)](
++        updated, partial, scale, base, reduced, post, dim, splits, triton.next_power_of_2(splits),
++        tile, norm_eps, gate_eps, magnitude, num_warps=4, enable_fp_fusion=False,
++    )
++    return reduced, post, updated

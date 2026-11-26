@@ -1,0 +1,110 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+index e8e2814..dd049e6 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+@@ -58,6 +58,7 @@ from vllm_ascend.models.hy_v4_flash_long import (
+     run_paged_sparse_attention,
+ )
+ from vllm_ascend.ops.triton.hy4_ihc_decode import decode_ihc_post, decode_ihc_pre, supports_decode_ihc
++from vllm_ascend.ops.triton.hy4_ihc_project import project_decode_ihc
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
+ 
+@@ -401,9 +402,18 @@ class AscendHYV4FlashHCLayer(HYV4HCLayer):
+                 and supports_decode_ihc(hidden_states)):
+             return super().pre(hidden_states)
+         pre = self.hc_pre
+-        mixes = pre.hc_fn(hidden_states.flatten(1).float())[0].contiguous()
+-        reduced, gates = decode_ihc_pre(hidden_states, mixes, pre.hc_scale, pre.hc_base,
+-                                        pre.layernorm_epsilon, pre.hc_eps, pre.magnitude)
++        projection = pre.hc_fn.weight
++        if (pre.hc_fn.bias is None and projection.dtype == torch.float32
++                and projection.shape == (8, 12288) and projection.is_contiguous()
++                and torch_npu.get_npu_format(projection) == torch_npu.Format.ND):
++            reduced, gates = project_decode_ihc(
++                hidden_states, projection, pre.hc_scale, pre.hc_base,
++                pre.layernorm_epsilon, pre.hc_eps, pre.magnitude,
++            )
++        else:
++            mixes = pre.hc_fn(hidden_states.flatten(1).float())[0].contiguous()
++            reduced, gates = decode_ihc_pre(hidden_states, mixes, pre.hc_scale, pre.hc_base,
++                                            pre.layernorm_epsilon, pre.hc_eps, pre.magnitude)
+         return reduced, gates, hidden_states
+ 
+     def post(self, output_with_bias, residual, post_gates):
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_project.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_project.py
+new file mode 100644
+index 0000000..a2ff342
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_project.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fused small-batch iHC FP32 projection and residual branch reduction."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _projection_parts(residual_ptr, weight_ptr, partial_ptr, STRIDE: tl.constexpr, TILE: tl.constexpr):
++    token = tl.program_id(0)
++    split = tl.program_id(1)
++    splits: tl.constexpr = STRIDE // TILE
++    column = split * TILE + tl.arange(0, TILE)
++    gate = tl.arange(0, 8)
++    residual = tl.load(residual_ptr + token * STRIDE + column).to(tl.float32)
++    weights = tl.load(weight_ptr + gate[:, None] * STRIDE + column[None, :])
++    projected = tl.sum(weights * residual[None, :], axis=1)
++    squared = tl.sum(residual * residual, axis=0)
++    partial = partial_ptr + (token * splits + split) * 16
++    tl.store(partial + gate, projected)
++    tl.store(partial + 8, squared)
++
++
++@triton.jit
++def _reduce_projected(
++    residual_ptr, partial_ptr, scale_ptr, base_ptr, reduced_ptr, post_ptr,
++    DIM: tl.constexpr, SPLITS: tl.constexpr, SPLIT_BLOCK: tl.constexpr,
++    BLOCK: tl.constexpr, NORM_EPS: tl.constexpr, GATE_EPS: tl.constexpr, MAGNITUDE: tl.constexpr,
++):
++    token = tl.program_id(0)
++    tile = tl.program_id(1)
++    split = tl.arange(0, SPLIT_BLOCK)
++    branch = tl.arange(0, 4)
++    partial = partial_ptr + (token * SPLITS + split) * 16
++    squares = tl.load(partial + 8, split < SPLITS, 0)
++    inverse_rms = tl.rsqrt(tl.sum(squares, axis=0) / (4 * DIM) + NORM_EPS)
++
++    pre_mixes = tl.load(partial[:, None] + branch[None, :], split[:, None] < SPLITS, 0)
++    pre = tl.sigmoid(tl.sum(pre_mixes, axis=0) * inverse_rms * tl.load(scale_ptr)
++                     + tl.load(base_ptr + branch)) + GATE_EPS
++    column = tile * BLOCK + tl.arange(0, BLOCK)
++    residual = tl.load(residual_ptr + (token * 4 + branch[:, None]) * DIM + column[None, :]).to(tl.float32)
++    reduced = tl.sum(pre[:, None] * residual, axis=0)
++    tl.store(reduced_ptr + token * DIM + column, reduced)
++
++    if tile == 0:
++        post_mixes = tl.load(partial[:, None] + 4 + branch[None, :], split[:, None] < SPLITS, 0)
++        post = MAGNITUDE * tl.sigmoid(
++            tl.sum(post_mixes, axis=0) * inverse_rms * tl.load(scale_ptr + 1)
++            + tl.load(base_ptr + 4 + branch)
++        ) + GATE_EPS
++        tl.store(post_ptr + token * 4 + branch, post)
++
++
++def project_decode_ihc(residual, weight, scale, base, norm_eps, gate_eps, magnitude):
++    tokens, branches, dim = residual.shape
++    width = branches * dim
++    tile = 512
++    splits = width // tile
++    partial = weight.new_empty((tokens, splits, 16), dtype=torch.float32)
++    reduced = residual.new_empty((tokens, dim))
++    post = weight.new_empty((tokens, branches), dtype=torch.float32)
++    _projection_parts[(tokens, splits)](
++        residual, weight, partial, width, tile, num_warps=4, enable_fp_fusion=False,
++    )
++    _reduce_projected[(tokens, dim // tile)](
++        residual, partial, scale, base, reduced, post, dim, splits, triton.next_power_of_2(splits),
++        tile, norm_eps, gate_eps, magnitude, num_warps=4, enable_fp_fusion=False,
++    )
++    return reduced, post

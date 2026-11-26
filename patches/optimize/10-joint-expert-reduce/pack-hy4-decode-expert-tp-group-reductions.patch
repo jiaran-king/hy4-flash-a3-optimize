@@ -1,0 +1,194 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py
+index 8d3a539..5f7a284 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -18,12 +18,14 @@ from __future__ import annotations
+ 
+ import torch
+ import torch.nn.functional as F
++from vllm.config import CUDAGraphMode
+ from vllm.distributed import (
+     get_dp_group,
+     get_ep_group,
+     get_tp_group,
+     tensor_model_parallel_all_reduce,
+ )
++from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
+ from vllm.model_executor.layers.fused_moe.layer import MoERunner
+ from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
+@@ -32,6 +34,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, uses_hy4_local_expert_decode
+ from vllm_ascend.distributed.parallel_state import get_mc2_group
+ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
++from vllm_ascend.ops.fused_moe.hy4_joint_expert_reduce import defer_routed_sum, reduce_expert_pair
+ from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
+ from vllm_ascend.ops.fused_moe.moe_mlp import maybe_record_event
+ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+@@ -219,14 +222,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+             hidden_states,
+         )
+ 
+-        result = self._forward_entry(
+-            hidden_states,
+-            router_logits,
+-            shared_experts_input,
+-            input_ids,
+-            self._encode_layer_name(),
+-            self.moe_config.hidden_dim_unpadded if self._quant_method.has_unpadded_output else 0,
+-        )
++        routed_dtype = None
++        if self._can_joint_hy4_reduce(hidden_states):
++            with defer_routed_sum() as pending:
++                result = self._forward_impl(hidden_states, router_logits, shared_experts_input, input_ids)
++            routed_dtype = pending.output_dtype
++        else:
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                shared_experts_input,
++                input_ids,
++                self._encode_layer_name(),
++                self.moe_config.hidden_dim_unpadded if self._quant_method.has_unpadded_output else 0,
++            )
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+@@ -250,6 +259,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+             # fails the aten schema check (List[Tensor]).
+             shared_output = None
+ 
++        if routed_dtype is not None:
++            fused_output, shared_output = reduce_expert_pair(fused_output, shared_output, routed_dtype)
++
+         if og_hidden_dim_pre_xform is not None:
+             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+ 
+@@ -257,14 +269,15 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+ 
+         # Latent routed output has to be reduced before output transform,
+         # because the transform may include non-linear normalization.
+-        fused_output, fused_output_is_reduced = self._maybe_reduce_routed_output_before_transform(
+-            fused_output,
+-            fused_output_is_reduced,
+-        )
++        if routed_dtype is None:
++            fused_output, fused_output_is_reduced = self._maybe_reduce_routed_output_before_transform(
++                fused_output,
++                fused_output_is_reduced,
++            )
+ 
+-        # If routed output is already reduced, reduce shared to match.
+-        # See note above re: the two all-reduce points.
+-        shared_output = self._maybe_reduce_shared_expert_output(shared_output, fused_output_is_reduced)
++            # If routed output is already reduced, reduce shared to match.
++            # See note above re: the two all-reduce points.
++            shared_output = self._maybe_reduce_shared_expert_output(shared_output, fused_output_is_reduced)
+ 
+         if self._megamoe_shared_expert_fused:
+             # MegaMoe folded routed_scaling_factor into the topk weights for
+@@ -287,6 +300,24 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+ 
+         return self._maybe_add_zero_expert_output(result)
+ 
++    def _can_joint_hy4_reduce(self, hidden_states: torch.Tensor) -> bool:
++        return (
++            uses_hy4_local_expert_decode()
++            and not torch.compiler.is_compiling()
++            and get_forward_context().cudagraph_runtime_mode is CUDAGraphMode.NONE
++            and _EXTRA_CTX.moe_comm_type is MoECommType.ALLGATHER
++            and self.ascend_shared_experts is not None
++            and self._get_shared_expert_parallel_mode() is SharedExpertParallelMode.TENSOR_PARALLEL
++            # Expert weights are unsharded within EP, but the output
++            # reduction still uses the model tensor-parallel group.
++            and self.moe_config.tp_group.world_size == 16
++            and self.moe_config.dp_size == self.moe_config.pcp_size == 1
++            and not self.moe_config.is_sequence_parallel
++            and hidden_states.ndim == 2
++            and 0 < hidden_states.shape[0] <= 4
++            and hidden_states.shape[1] == 1536
++        )
++
+     @property
+     def is_internal_router(self) -> bool:
+         # main (cdc4824a21): vllm#51838 removed the gate branch in
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/hy4_joint_expert_reduce.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/hy4_joint_expert_reduce.py
+new file mode 100644
+index 0000000..4a0bbbd
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/hy4_joint_expert_reduce.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Pair HY4 small-decode expert reductions in FP32 before restoring BF16."""
++
++from contextlib import contextmanager
++from dataclasses import dataclass
++
++import torch
++from vllm.distributed import tensor_model_parallel_all_reduce
++from vllm.forward_context import get_forward_context
++
++
++_DEFERRED_REDUCTION = "hy4_deferred_moe_reduction"
++
++
++@dataclass
++class DeferredRoutedSum:
++    output_dtype: torch.dtype | None = None
++
++
++@contextmanager
++def defer_routed_sum():
++    kwargs = get_forward_context().additional_kwargs
++    if _DEFERRED_REDUCTION in kwargs:
++        raise RuntimeError("Nested HY4 expert reduction")
++    state = DeferredRoutedSum()
++    kwargs[_DEFERRED_REDUCTION] = state
++    try:
++        yield state
++    finally:
++        del kwargs[_DEFERRED_REDUCTION]
++
++
++def deferred_routed_sum():
++    return get_forward_context().additional_kwargs.get(_DEFERRED_REDUCTION)
++
++
++def reduce_expert_pair(routed, shared, routed_dtype):
++    if (shared is None or shared.dtype != torch.bfloat16 or routed.dtype != torch.float32
++            or routed_dtype != torch.bfloat16):
++        routed = tensor_model_parallel_all_reduce(routed).to(routed_dtype)
++        if shared is not None:
++            shared = tensor_model_parallel_all_reduce(shared)
++        return routed, shared
++
++    packed = torch.cat((routed.reshape(-1), shared.reshape(-1).float()))
++    packed = tensor_model_parallel_all_reduce(packed)
++    routed_sum, shared_sum = packed.split((routed.numel(), shared.numel()))
++    return routed_sum.view_as(routed).to(routed_dtype), shared_sum.view_as(shared).to(shared.dtype)
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py
+index b75dd35..64e79bf 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/fused_moe/token_dispatcher.py
+@@ -32,6 +32,7 @@ from vllm.distributed.parallel_state import get_ep_group
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity, uses_hy4_local_expert_decode
+ from vllm_ascend.device.device_op import DeviceOperator
++from vllm_ascend.ops.fused_moe.hy4_joint_expert_reduce import deferred_routed_sum
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.distributed.parallel_state import get_mc2_group
+ from vllm_ascend.lora.fused_moe import (
+@@ -467,7 +468,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+                 sorted_indices=combine_metadata.expanded_row_idx,
+                 probs=combine_metadata.topk_weights.float(),
+             )
+-            final_hidden_states = tensor_model_parallel_all_reduce(local_sum).to(hidden_states.dtype)
++            deferred = deferred_routed_sum()
++            if deferred is None:
++                final_hidden_states = tensor_model_parallel_all_reduce(local_sum).to(hidden_states.dtype)
++            else:
++                deferred.output_dtype = hidden_states.dtype
++                final_hidden_states = local_sum
+         else:
+             final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
+                 permuted_tokens=hidden_states,
