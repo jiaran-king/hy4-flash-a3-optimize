@@ -1,0 +1,21 @@
+patches/optimize/07-aclnn-host-cache/README.md
+  s_61b688964f46ae::t_d634df220e1d82 1-15
+patches/optimize/07-aclnn-host-cache/stabilize-hy4-aclnn-host-cache.patch
+  s_61b688964f46ae::t_a05519fb4dff84 1-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ae377e14a492fb08a80b4631a7fd7a40ea90d141",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
