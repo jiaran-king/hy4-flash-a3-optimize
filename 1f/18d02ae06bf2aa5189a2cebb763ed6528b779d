@@ -1,0 +1,25 @@
+patches/optimize/06-prefill-selection-swa/README.md
+  s_61b688964f46ae::t_7e50c7118371e6 1-17
+patches/optimize/06-prefill-selection-swa/batch-prefill-indexpool-selection.patch
+  s_61b688964f46ae::t_af0b8313b5a742 1-46
+patches/optimize/06-prefill-selection-swa/enable-four-head-swa-sparse.patch
+  s_61b688964f46ae::t_fa8d24be14bd22 1-14
+patches/optimize/06-prefill-selection-swa/fuse-swa-prefill-sparse-attention.patch
+  s_61b688964f46ae::t_16ae8aca52c3d5 1-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1f18d02ae06bf2aa5189a2cebb763ed6528b779d",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
