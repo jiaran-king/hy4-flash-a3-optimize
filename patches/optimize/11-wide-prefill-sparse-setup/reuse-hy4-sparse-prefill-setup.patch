@@ -1,0 +1,199 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+index 82c5165..f1f6b5e 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -8,6 +8,12 @@ from functools import lru_cache
+ import torch
+ 
+ from vllm_ascend.ops.triton.hy4_paged_decode import paged_decode_attention, supports_paged_decode
++from vllm_ascend.ops.triton.hy4_sparse_prefill_epilogue import (
++    prefill_pages,
++    read_prefill_span,
++    supports_sink_write,
++    write_sparse_sink,
++)
+ 
+ 
+ QUERY_CHUNK = 128
+@@ -65,14 +71,20 @@ def _swa_mask(queries, keys, offset, window, device):
+     )
+ 
+ 
+-def _sparse_prefill(query, query_rope, latent, rope, indexes, sinks, scale):
++def _sparse_prefill(query, query_rope, latent, rope, indexes, sinks, scale, output, prefill_state):
+     import torch_npu
+ 
+     # The operator returns the ordinary attention output plus statistics for
+     # the same FP32 softmax denominator. A zero-value sink only changes that
+     # denominator, so rescale the output using the sink logit.
+-    lengths_q = torch.tensor([query.shape[0]], device=query.device, dtype=torch.int32)
+-    lengths_kv = torch.tensor([latent.shape[0]], device=query.device, dtype=torch.int32)
++    # These sizes are immutable and shared by layers in the same forward.
++    length_key = ("lengths", query.device, query.shape[0], latent.shape[0])
++    if length_key not in prefill_state:
++        prefill_state[length_key] = (
++            torch.tensor([query.shape[0]], device=query.device, dtype=torch.int32),
++            torch.tensor([latent.shape[0]], device=query.device, dtype=torch.int32),
++        )
++    lengths_q, lengths_kv = prefill_state[length_key]
+     attended, maximum, exp_sum = torch_npu.npu_sparse_flash_attention(
+         query.contiguous(), latent, latent, indexes[:, None, :].contiguous(), scale,
+         query_rope=query_rope.contiguous(), key_rope=rope,
+@@ -83,8 +95,11 @@ def _sparse_prefill(query, query_rope, latent, rope, indexes, sinks, scale):
+     maximum = maximum.squeeze(0)
+     exp_sum = exp_sum.squeeze(0)
+     attenuation = torch.sigmoid(maximum + exp_sum.log() - sinks.float())
+-    output = attended.float() * attenuation[..., None]
+-    return output.masked_fill_(exp_sum[..., None] == 0, 0)
++    if supports_sink_write(attended, attenuation, exp_sum, output):
++        write_sparse_sink(attended, attenuation, exp_sum, output)
++    else:
++        values = attended.float() * attenuation[..., None]
++        output.copy_(values.masked_fill_(exp_sum[..., None] == 0, 0))
+ 
+ 
+ def attend_paged_with_sink(
+@@ -102,6 +117,7 @@ def attend_paged_with_sink(
+     shared_window: int = 0,
+     native_sparse: bool = False,
+     decode_lengths: torch.Tensor | None = None,
++    prefill_state: dict | None = None,
+ ) -> torch.Tensor:
+     # Keep the original logical token selection, including SWA and IndexPool.
+     # Each sink adds a logit to the denominator and has a zero value.
+@@ -156,6 +172,8 @@ def attend_paged_with_sink(
+         and (heads == 2 or (shared_window > 0 and heads == 4))
+         and query_rope.shape[-1] == 64 and latent_cache.shape[2] == 1
+     )
++    if native_sparse and prefill_state is None:
++        prefill_state = {}
+     request_start = singletons
+     for request, (request_end, sequence_length) in enumerate(
+         zip(query_ends[singletons:], sequence_lengths[singletons:], strict=True), start=singletons
+@@ -165,21 +183,33 @@ def attend_paged_with_sink(
+         if share:
+             first_query = sequence_length - request_queries
+             first_key = max(0, first_query + 1 - shared_window)
++            if native_sparse and request_queries >= QUERY_CHUNK:
++                # Gather whole pages and then take the exact logical span.
++                table = block_tables[request]
++                page_key = ("pages", table.data_ptr(), table.shape, table.stride(),
++                            first_key, sequence_length, block_size)
++                if page_key not in prefill_state:
++                    prefill_state[page_key] = prefill_pages(table, first_key, sequence_length, block_size)
++                latent, rope = read_prefill_span(
++                    latent_cache, rope_cache, prefill_state[page_key], first_key, sequence_length,
++                )
++                # The window selection is already shared by all SWA layers.
++                selected = selected_tokens[request_start:request_end]
++                index_key = ("swa_indexes", selected.data_ptr(), selected.shape, selected.stride(), first_key)
++                if index_key not in prefill_state:
++                    prefill_state[index_key] = selected.sub(first_key).clamp_min_(-1)
++                span = slice(request_start, request_end)
++                _sparse_prefill(
++                    query_latent[span], query_rope[span], latent, rope, prefill_state[index_key],
++                    sinks, scale, output[span], prefill_state,
++                )
++                request_start = request_end
++                continue
+             position = torch.arange(first_key, sequence_length, device=query_latent.device)
+             block = block_tables[request].index_select(0, position // block_size).long()
+             slots = block * block_size + position % block_size
+             latent = flat_latent.index_select(0, slots)
+             rope = flat_rope.index_select(0, slots)
+-            if native_sparse and request_queries >= QUERY_CHUNK:
+-                # Rebase the selection into this request's contiguous KV span.
+-                selected = selected_tokens[request_start:request_end]
+-                indexes = selected.sub(first_key).clamp_min_(-1)
+-                output[request_start:request_end].copy_(_sparse_prefill(
+-                    query_latent[request_start:request_end], query_rope[request_start:request_end],
+-                    latent[:, None, :], rope[:, None, :], indexes, sinks, scale,
+-                ))
+-                request_start = request_end
+-                continue
+             latent = latent.float()
+             rope = rope.float()
+             for start in range(request_start, request_end, QUERY_CHUNK):
+@@ -199,10 +229,11 @@ def attend_paged_with_sink(
+             pages = block_tables[request, :page_count].long()
+             latent = latent_cache.index_select(0, pages).flatten(0, 1)[:sequence_length]
+             rope = rope_cache.index_select(0, pages).flatten(0, 1)[:sequence_length]
+-            output[request_start:request_end].copy_(_sparse_prefill(
+-                query_latent[request_start:request_end], query_rope[request_start:request_end],
+-                latent, rope, selected_tokens[request_start:request_end], sinks, scale,
+-            ))
++            span = slice(request_start, request_end)
++            _sparse_prefill(
++                query_latent[span], query_rope[span], latent, rope, selected_tokens[span],
++                sinks, scale, output[span], prefill_state,
++            )
+             request_start = request_end
+             continue
+         padding = None
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index cc9dc46..00c81bf 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -357,6 +357,8 @@ def run_paged_sparse_attention(attention, hidden, q_c, positions, q, latent, rop
+             attention.scaling,
+             shared_window=shared_window,
+             native_sparse=native_sparse,
++            prefill_state=context.additional_kwargs.setdefault("hy4_sparse_prefill_setup", {})
++            if native_sparse else None,
+             decode_lengths=metadata.seq_lens_gpu if attention.use_a3_paged_decode else None,
+         )
+         value = torch.bmm(attended.transpose(0, 1), attention._value_projection).transpose(0, 1)
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_sparse_prefill_epilogue.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_sparse_prefill_epilogue.py
+new file mode 100644
+index 0000000..eae0222
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_sparse_prefill_epilogue.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Read contiguous prefill KV spans by page and write the sparse sink epilogue."""
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def prefill_pages(block_table, first, end, block_size):
++    first_page = first // block_size
++    last_page = (end + block_size - 1) // block_size
++    return block_table[first_page:last_page].long()
++
++
++def read_prefill_span(latent_cache, rope_cache, pages, first, end):
++    offset = first % latent_cache.shape[1]
++    selected = slice(offset, offset + end - first)
++    return (latent_cache.index_select(0, pages).flatten(0, 1)[selected],
++            rope_cache.index_select(0, pages).flatten(0, 1)[selected])
++
++
++def supports_sink_write(attended, coefficient, denominator, output):
++    return (
++        HAS_TRITON and attended.device.type == "npu" and attended.ndim == 3
++        and attended.shape == output.shape and attended.shape[-1] == 512
++        and attended.dtype == output.dtype == torch.bfloat16
++        and attended.shape[:2] == coefficient.shape == denominator.shape
++        and coefficient.dtype == denominator.dtype == torch.float32
++        and attended.is_contiguous() and output.is_contiguous()
++        and coefficient.is_contiguous() and denominator.is_contiguous()
++    )
++
++
++@triton.jit(do_not_specialize=["rows_total"])
++def _write_sink(input_ptr, factor_ptr, sum_ptr, output_ptr, rows_total):
++    row = tl.program_id(0) * 4 + tl.arange(0, 4)
++    column = tl.arange(0, 512)
++    offsets = row[:, None] * 512 + column[None, :]
++    valid = row < rows_total
++    attended = tl.load(input_ptr + offsets, valid[:, None], other=0).to(tl.float32)
++    attenuation = tl.load(factor_ptr + row, valid, other=0)
++    denominator = tl.load(sum_ptr + row, valid, other=0)
++    value = tl.where(denominator[:, None] == 0, 0.0, attended * attenuation[:, None])
++    tl.store(output_ptr + offsets, value, valid[:, None])
++
++
++def write_sparse_sink(attended, coefficient, denominator, output):
++    rows = attended.shape[0] * attended.shape[1]
++    _write_sink[(triton.cdiv(rows, 4),)](attended, coefficient, denominator, output, rows, num_warps=4)

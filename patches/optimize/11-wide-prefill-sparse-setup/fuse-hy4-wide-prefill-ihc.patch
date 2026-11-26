@@ -1,0 +1,135 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+index 739fbc2..b4b7c70 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+@@ -62,6 +62,12 @@ from vllm_ascend.models.hy_v4_flash_long import (
+ )
+ from vllm_ascend.ops.triton.hy4_ihc_decode import decode_ihc_post, decode_ihc_pre, supports_decode_ihc
+ from vllm_ascend.ops.triton.hy4_ihc_handoff import project_decode_ihc_after_update
++from vllm_ascend.ops.triton.hy4_ihc_prefill import (
++    prepare_prefill_ihc,
++    reduce_prefill_ihc,
++    supports_prefill_ihc,
++    update_prefill_ihc,
++)
+ from vllm_ascend.ops.triton.hy4_ihc_project import project_decode_ihc
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
+@@ -425,6 +431,20 @@ class AscendHYV4FlashHCLayer(HYV4HCLayer):
+         return None
+ 
+     def pre(self, hidden_states):
++        if (self.use_a3_ihc and self.enable_ihc and self.hc_pre.hpc_op is None
++                and supports_prefill_ihc(hidden_states)):
++            pre = self.hc_pre
++            flat, inverse = prepare_prefill_ihc(hidden_states, pre.layernorm_epsilon)
++            mixes = pre.hc_fn(flat)[0] * inverse
++            channels = pre.hc_mult
++            pre_gates = torch.sigmoid(
++                mixes[..., :channels] * pre.hc_scale[0].float() + pre.hc_base[:channels].float()
++            ) + pre.hc_eps
++            post_gates = pre.magnitude * torch.sigmoid(
++                mixes[..., channels:] * pre.hc_scale[1].float() + pre.hc_base[channels:].float()
++            ) + pre.hc_eps
++            reduced = reduce_prefill_ihc(hidden_states, pre_gates.contiguous())
++            return reduced, post_gates, hidden_states
+         if not self._supports_small_pre(hidden_states):
+             return super().pre(hidden_states)
+         pre = self.hc_pre
+@@ -460,6 +480,12 @@ class AscendHYV4FlashHCLayer(HYV4HCLayer):
+         return None
+ 
+     def post(self, output_with_bias, residual, post_gates):
++        if (self.use_a3_ihc and self.enable_ihc and self.hc_post.hpc_op is None
++                and supports_prefill_ihc(residual) and post_gates is not None
++                and post_gates.dtype == torch.float32 and post_gates.shape == residual.shape[:2]
++                and output_with_bias.dtype == residual.dtype and output_with_bias.is_contiguous()
++                and output_with_bias.shape == (residual.shape[0], residual.shape[2])):
++            return update_prefill_ihc(output_with_bias, residual, post_gates.contiguous())
+         update = self.defer_small_update(output_with_bias, residual, post_gates)
+         if update is not None:
+             return update.materialize()
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_prefill.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_prefill.py
+new file mode 100644
+index 0000000..a9a3285
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_prefill.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fused FP32 iHC preparation and branch epilogues for wide A3 stages."""
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def supports_prefill_ihc(residual):
++    return (
++        HAS_TRITON and residual.device.type == "npu" and residual.dtype == torch.bfloat16
++        and residual.ndim == 3 and residual.shape[1:] == (4, 3072)
++        and 128 <= residual.shape[0] <= 2048 and residual.is_contiguous()
++    )
++
++
++@triton.jit
++def _cast_and_rms(input_ptr, projection_ptr, inverse_ptr, WIDTH: tl.constexpr, EPS: tl.constexpr):
++    row = tl.program_id(0)
++    columns = tl.arange(0, 16384)
++    offset = row * WIDTH + columns
++    source = tl.load(input_ptr + offset, columns < WIDTH, other=0).to(tl.float32)
++    tl.store(projection_ptr + offset, source, columns < WIDTH)
++    inverse = tl.rsqrt(tl.sum(source * source, axis=0) / WIDTH + EPS)
++    tl.store(inverse_ptr + row, inverse)
++
++
++@triton.jit
++def _reduce_channels(input_ptr, gate_ptr, output_ptr, DIM: tl.constexpr, TILE: tl.constexpr):
++    token = tl.program_id(0)
++    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
++    channel = tl.arange(0, 4)
++    gate = tl.load(gate_ptr + token * 4 + channel)
++    values = tl.load(input_ptr + (token * 4 + channel[:, None]) * DIM + column[None, :],
++                     column[None, :] < DIM, other=0).to(tl.float32)
++    result = tl.sum(values * gate[:, None], axis=0)
++    tl.store(output_ptr + token * DIM + column, result, column < DIM)
++
++
++@triton.jit
++def _update_channels(output_ptr, residual_ptr, gate_ptr, result_ptr, DIM: tl.constexpr, TILE: tl.constexpr):
++    token = tl.program_id(0)
++    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
++    channel = tl.arange(0, 4)
++    gate = tl.load(gate_ptr + token * 4 + channel)
++    output = tl.load(output_ptr + token * DIM + column, column < DIM, other=0).to(tl.float32)
++    offset = (token * 4 + channel[:, None]) * DIM + column[None, :]
++    residual = tl.load(residual_ptr + offset, column[None, :] < DIM, other=0).to(tl.float32)
++    result = (gate[:, None] * output[None, :]) + residual
++    tl.store(result_ptr + offset, result, column[None, :] < DIM)
++
++
++def prepare_prefill_ihc(residual, eps):
++    tokens, channels, dim = residual.shape
++    projection = residual.new_empty((tokens, channels * dim), dtype=torch.float32)
++    inverse = projection.new_empty((tokens, 1))
++    _cast_and_rms[(tokens,)](residual, projection, inverse, channels * dim, eps,
++                              num_warps=4, enable_fp_fusion=False)
++    return projection, inverse
++
++
++def reduce_prefill_ihc(residual, gates):
++    tokens, _, dim = residual.shape
++    output = residual.new_empty((tokens, dim))
++    tile = 1024
++    _reduce_channels[(tokens, triton.cdiv(dim, tile))](
++        residual, gates, output, dim, tile, num_warps=4, enable_fp_fusion=False,
++    )
++    return output
++
++
++def update_prefill_ihc(output, residual, gates):
++    tokens, _, dim = residual.shape
++    result = torch.empty_like(residual)
++    tile = 1024
++    _update_channels[(tokens, triton.cdiv(dim, tile))](
++        output, residual, gates, result, dim, tile, num_warps=4, enable_fp_fusion=False,
++    )
++    return result

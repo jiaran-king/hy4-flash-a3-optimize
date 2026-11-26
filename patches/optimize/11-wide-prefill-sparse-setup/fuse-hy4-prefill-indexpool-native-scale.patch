@@ -1,0 +1,102 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index 82ef836..cc9dc46 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -28,6 +28,7 @@ from vllm_ascend.models.hy_v4_flash_a3_indexpool import (
+     select_ordered_groups,
+     select_prefill_groups,
+ )
++from vllm_ascend.ops.triton.hy4_indexpool_prefill_fwht import prefill_fwht, quantize_prefill_fwht, supports_prefill_fwht
+ from vllm_ascend.ops.triton.hy4_indexpool_quant import (
+     indexpool_rotary_frequencies,
+     quantize_indexpool_rotary,
+@@ -85,6 +86,10 @@ def _quantized_vectors(vectors, use_a3_quant):
+     rows = vectors.reshape(-1, INDEX_DIM).bfloat16()
+     if use_a3_quant and supports_indexpool_quant(rows):
+         return quantize_indexpool_rows(rows).view_as(vectors)
++    if use_a3_quant and supports_prefill_fwht(rows):
++        transformed, peaks = prefill_fwht(rows)
++        scales = torch.exp2(torch.ceil(torch.log2(peaks.clamp_min(1e-4) / 448.0)))
++        return quantize_prefill_fwht(transformed, scales).view_as(vectors)
+     values, scales = fwht_scaled(rows)
+     quantized = round_e4m3fn(values)
+     return (quantized * scales[:, None]).to(torch.bfloat16).view_as(vectors)
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_prefill_fwht.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_prefill_fwht.py
+new file mode 100644
+index 0000000..a4da266
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_indexpool_prefill_fwht.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fuse the seven FP32 Hadamard stages for wide IndexPool inputs."""
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def supports_prefill_fwht(rows):
++    return (
++        HAS_TRITON and rows.device.type == "npu" and rows.dtype == torch.bfloat16
++        and rows.ndim == 2 and rows.shape[1] == 128 and 128 < rows.shape[0] <= 32768
++        and rows.is_contiguous()
++    )
++
++
++@triton.jit
++def _fwht_rows(input_ptr, output_ptr, peaks_ptr, ROWS: tl.constexpr, ROW_TILE: tl.constexpr):
++    rows = tl.program_id(0) * ROW_TILE + tl.arange(0, ROW_TILE)
++    lane = tl.arange(0, 128)
++    offsets = rows[:, None] * 128 + lane[None, :]
++    valid = rows < ROWS
++    values = tl.load(input_ptr + offsets, valid[:, None], other=0).to(tl.float32)
++    for step in tl.static_range(0, 7):
++        stride = 1 << step
++        partner = tl.broadcast_to((lane ^ stride)[None, :], (ROW_TILE, 128))
++        other = tl.gather(values, partner, axis=1)
++        values = tl.where((lane[None, :] & stride) != 0, other - values, values + other)
++    values *= 128 ** -0.5
++    peak = tl.max(tl.abs(values), axis=1)
++    tl.store(output_ptr + offsets, values, valid[:, None])
++    tl.store(peaks_ptr + rows, peak, valid)
++
++
++def prefill_fwht(rows):
++    transformed = torch.empty_like(rows, dtype=torch.float32)
++    peaks = rows.new_empty((rows.shape[0],), dtype=torch.float32)
++    tile = 16
++    _fwht_rows[(triton.cdiv(rows.shape[0], tile),)](
++        rows, transformed, peaks, rows.shape[0], tile, num_warps=4, enable_fp_fusion=False,
++    )
++    return transformed, peaks
++
++
++@triton.jit
++def _round_with_scale(transformed_ptr, scale_ptr, result_ptr, ROWS: tl.constexpr, ROW_TILE: tl.constexpr):
++    row = tl.program_id(0) * ROW_TILE + tl.arange(0, ROW_TILE)
++    column = tl.arange(0, 128)
++    valid = row < ROWS
++    offsets = row[:, None] * 128 + column[None, :]
++    scale = tl.load(scale_ptr + row, valid, other=1.0)
++    source = tl.load(transformed_ptr + offsets, valid[:, None], other=0) / scale[:, None]
++    magnitude = tl.minimum(tl.abs(source), 448.0)
++    bits = magnitude.to(tl.int32, bitcast=True)
++    retained = ((bits & 0x100000) != 0).to(tl.int32)
++    normal = ((bits + 0x7FFFF + retained) & -0x100000).to(tl.float32, bitcast=True)
++    ticks = magnitude * 512.0
++    whole = ticks.to(tl.int32)
++    fraction = ticks - whole.to(tl.float32)
++    round_up = (fraction > 0.5) | ((fraction == 0.5) & ((whole & 1) != 0))
++    subnormal = (whole + round_up.to(tl.int32)).to(tl.float32) * (1.0 / 512.0)
++    rounded = tl.where(magnitude < 1.0 / 64.0, subnormal, normal)
++    signed = tl.where(source < 0.0, -rounded, rounded)
++    tl.store(result_ptr + offsets, signed * scale[:, None], valid[:, None])
++
++
++def quantize_prefill_fwht(transformed, scales):
++    output = transformed.new_empty(transformed.shape, dtype=torch.bfloat16)
++    rows = transformed.shape[0]
++    tile = 16
++    _round_with_scale[(triton.cdiv(rows, tile),)](
++        transformed, scales, output, rows, tile, num_warps=4, enable_fp_fusion=False,
++    )
++    return output
