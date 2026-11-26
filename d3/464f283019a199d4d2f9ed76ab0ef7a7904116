@@ -1,0 +1,29 @@
+patches/optimize/10-joint-expert-reduce/README.md
+  s_61b688964f46ae::t_522201c1d21c0f 1-19
+patches/optimize/10-joint-expert-reduce/fuse-hy4-ihc-decode-projection.patch
+  s_61b688964f46ae::t_72b5466f628526 1-110
+patches/optimize/10-joint-expert-reduce/fuse-hy4-ihc-residual-handoff.patch
+  s_61b688964f46ae::t_9671f46a9b6d90 1-229
+patches/optimize/10-joint-expert-reduce/fuse-hy4-indexpool-rotary-quant.patch
+  s_61b688964f46ae::t_052ca9bf3f512b 1-123
+patches/optimize/10-joint-expert-reduce/fuse-hy4-small-indexpool-stages.patch
+  s_61b688964f46ae::t_0d988a5d71d32a 1-158
+patches/optimize/10-joint-expert-reduce/pack-hy4-decode-expert-tp-group-reductions.patch
+  s_61b688964f46ae::t_46c4cdfb194894 1-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d3464f283019a199d4d2f9ed76ab0ef7a7904116",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
