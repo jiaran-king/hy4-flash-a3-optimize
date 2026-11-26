@@ -1,0 +1,33 @@
+patches/optimize/04-native-sparse-prefill/README.md
+  s_61b688964f46ae::t_f65ccac2811ec7 1-21
+patches/optimize/04-native-sparse-prefill/batch-decode-prefix-in-mixed-steps.patch
+  s_61b688964f46ae::t_dcf54e3dcfc17b 1-64
+patches/optimize/04-native-sparse-prefill/fuse-long-prefill-sparse-attention.patch
+  s_61b688964f46ae::t_a462b440478664 1-93
+patches/optimize/04-native-sparse-prefill/keep-indexpool-rounding-on-vector-cores.patch
+  s_61b688964f46ae::t_e77e30c48e4ce6 1-19
+patches/optimize/04-native-sparse-prefill/native-bf16-prefill-bmm.patch
+  s_61b688964f46ae::t_7e7cb2350f2e41 1-60
+patches/optimize/04-native-sparse-prefill/share-swa-kv-tiles.patch
+  s_61b688964f46ae::t_34cc7e16573f3e 1-120
+patches/optimize/04-native-sparse-prefill/share-swa-span.patch
+  s_61b688964f46ae::t_bb4020f8c8962d 1-78
+patches/optimize/04-native-sparse-prefill/spread-masked-kv-slots.patch
+  s_61b688964f46ae::t_2bd146b6769b95 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a8b4d7299f23765fa054c8b7d67da5c0bfcc5f35",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
