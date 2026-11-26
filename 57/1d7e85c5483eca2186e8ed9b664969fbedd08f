@@ -1,0 +1,27 @@
+patches/optimize/11-wide-prefill-sparse-setup/README.md
+  s_61b688964f46ae::t_643cc27f193f8d 1-18
+patches/optimize/11-wide-prefill-sparse-setup/fuse-hy4-prefill-indexpool-native-scale.patch
+  s_61b688964f46ae::t_0daef9aa129a3c 1-102
+patches/optimize/11-wide-prefill-sparse-setup/fuse-hy4-wide-prefill-ihc.patch
+  s_61b688964f46ae::t_5fd9a97883ee1f 1-135
+patches/optimize/11-wide-prefill-sparse-setup/reuse-hy4-prefill-quant-kernels.patch
+  s_61b688964f46ae::t_2e00d2401ec9ce 1-44
+patches/optimize/11-wide-prefill-sparse-setup/reuse-hy4-sparse-prefill-setup.patch
+  s_61b688964f46ae::t_43a9d508613de6 1-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "571d7e85c5483eca2186e8ed9b664969fbedd08f",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
