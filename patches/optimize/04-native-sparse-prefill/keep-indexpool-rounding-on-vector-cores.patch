@@ -1,0 +1,19 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_fp8.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3_fp8.py
+@@ -10,14 +10,10 @@
+     # FP32 has 23 mantissa bits and E4M3FN has 3. The integer bias
+     # rounds to nearest, with the retained bit deciding midpoint ties.
+     bits = magnitude.view(torch.int32)
+-    retained = (bits >> 20) & 1
++    retained = ((bits & 0x100000) != 0).to(torch.int32)
+     normal = ((bits + 0x7FFFF + retained) & ~0xFFFFF).view(torch.float32)
+ 
+     # E4M3FN subnormals are spaced at exactly 2**-9.
+-    units = magnitude * 512.0
+-    lower = units.floor()
+-    fraction = units - lower
+-    increment = (fraction > 0.5) | ((fraction == 0.5) & ((lower.long() & 1) != 0))
+-    subnormal = (lower + increment) * (2.0**-9)
++    subnormal = (magnitude * 512.0).round() * (2.0**-9)
+     rounded = torch.where(magnitude < 2.0**-6, subnormal, normal)
+     return rounded * values.sign()

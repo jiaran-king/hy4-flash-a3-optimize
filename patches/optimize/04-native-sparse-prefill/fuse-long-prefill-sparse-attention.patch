@@ -1,0 +1,93 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -63,6 +63,28 @@
+     )
+ 
+ 
++def _sparse_prefill(query, query_rope, latent, rope, indexes, sinks, scale):
++    import torch_npu
++
++    # The operator returns the ordinary attention output plus statistics for
++    # the same FP32 softmax denominator. A zero-value sink only changes that
++    # denominator, so rescale the output using the sink logit.
++    lengths_q = torch.tensor([query.shape[0]], device=query.device, dtype=torch.int32)
++    lengths_kv = torch.tensor([latent.shape[0]], device=query.device, dtype=torch.int32)
++    attended, maximum, exp_sum = torch_npu.npu_sparse_flash_attention(
++        query.contiguous(), latent, latent, indexes[:, None, :].contiguous(), scale,
++        query_rope=query_rope.contiguous(), key_rope=rope,
++        actual_seq_lengths_query=lengths_q, actual_seq_lengths_kv=lengths_kv,
++        layout_query="TND", layout_kv="TND", sparse_mode=3, attention_mode=2,
++        return_softmax_lse=True,
++    )
++    maximum = maximum.squeeze(0)
++    exp_sum = exp_sum.squeeze(0)
++    attenuation = torch.sigmoid(maximum + exp_sum.log() - sinks.float())
++    output = attended.float() * attenuation[..., None]
++    return output.masked_fill_(exp_sum[..., None] == 0, 0)
++
++
+ def attend_paged_with_sink(
+     query_latent: torch.Tensor,
+     query_rope: torch.Tensor,
+@@ -76,6 +98,7 @@
+     scale: float,
+     *,
+     shared_window: int = 0,
++    native_sparse: bool = False,
+ ) -> torch.Tensor:
+     # Keep the original logical token selection, including SWA and IndexPool.
+     # Each sink adds a logit to the denominator and has a zero value.
+@@ -105,6 +128,10 @@
+     native_bmm = query_latent.device.type == "npu" and (
+         query_latent.dtype == query_rope.dtype == latent_cache.dtype == rope_cache.dtype == torch.bfloat16
+     )
++    native_sparse = (
++        native_sparse and native_bmm and query_latent.shape[1:] == (2, 512)
++        and query_rope.shape[-1] == 64 and latent_cache.shape[2] == 1
++    )
+     request_start = 0
+     for request, (request_end, sequence_length) in enumerate(
+         zip(query_ends, sequence_lengths, strict=True)
+@@ -129,6 +156,17 @@
+                     latent[key - first_key:last], rope[key - first_key:last],
+                     query - key, shared_window, sinks, scale,
+                 ))
++            request_start = request_end
++            continue
++        if native_sparse and request_queries >= QUERY_CHUNK:
++            page_count = (sequence_length + block_size - 1) // block_size
++            pages = block_tables[request, :page_count].long()
++            latent = latent_cache.index_select(0, pages).flatten(0, 1)[:sequence_length]
++            rope = rope_cache.index_select(0, pages).flatten(0, 1)[:sequence_length]
++            output[request_start:request_end].copy_(_sparse_prefill(
++                query_latent[request_start:request_end], query_rope[request_start:request_end],
++                latent, rope, selected_tokens[request_start:request_end], sinks, scale,
++            ))
+             request_start = request_end
+             continue
+         padding = None
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -238,12 +238,14 @@
+     # Text-only MRoPE supplies identical coordinates on each axis.
+     positions = positions[0, :tokens] if positions.ndim == 2 else positions[:tokens]
+     shared_window = 0
++    native_sparse = False
+     if attention.is_window_layer:
+         topk = _swa_indices(positions, attention.config.sliding_window)
+         if _has_contiguous_logical_positions(context, metadata, positions):
+             shared_window = attention.config.sliding_window
+     else:
+         topk = attention.indexer(hidden[:tokens], q_c[:tokens], positions)
++        native_sparse = _has_contiguous_logical_positions(context, metadata, positions)
+     kv_cache, rope_cache = attention.attn.kv_cache
+     with attention_transfer_window():
+         slots = metadata.slot_mapping[:tokens].long()
+@@ -263,6 +265,7 @@
+             attention.learnable_sink_param,
+             attention.scaling,
+             shared_window=shared_window,
++            native_sparse=native_sparse,
+         )
+         value = torch.bmm(attended.transpose(0, 1), attention._value_projection).transpose(0, 1)
+         output[:tokens].copy_(value.flatten(1))

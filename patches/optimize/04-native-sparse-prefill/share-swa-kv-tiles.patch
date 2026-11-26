@@ -1,0 +1,120 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -27,6 +27,32 @@
+     return torch.bmm(weights, vectors)
+ 
+ 
++def _shared_swa_tile(
++    query_latent, query_rope, flat_latent, flat_rope, block_table,
++    first_query, window, block_size, sinks, scale,
++):
++    queries, heads, dimension = query_latent.shape
++    first_key = max(0, first_query + 1 - window)
++    key_positions = torch.arange(
++        first_key, first_query + queries, device=query_latent.device, dtype=torch.long
++    )
++    blocks = block_table.index_select(0, key_positions // block_size).long()
++    slots = blocks * block_size + key_positions % block_size
++    latent = flat_latent.index_select(0, slots).float()
++    rope = flat_rope.index_select(0, slots).float()
++    q_latent = query_latent.reshape(queries * heads, dimension).float()
++    q_rope = query_rope.reshape(queries * heads, query_rope.shape[-1]).float()
++    logits = (q_latent @ latent.T + q_rope @ rope.T).reshape(queries, heads, -1) * scale
++    query_positions = first_query + torch.arange(queries, device=query_latent.device)
++    valid = (key_positions <= query_positions[:, None]) & (
++        key_positions > query_positions[:, None] - window
++    )
++    logits.masked_fill_(~valid[:, None, :], -torch.inf)
++    sink = sinks.float().reshape(1, -1, 1).expand(queries, -1, 1)
++    weights = torch.cat((logits, sink), dim=-1).softmax(dim=-1)[..., :-1]
++    return (weights.reshape(queries * heads, -1) @ latent).reshape_as(query_latent)
++
++
+ def attend_paged_with_sink(
+     query_latent: torch.Tensor,
+     query_rope: torch.Tensor,
+@@ -38,6 +64,8 @@
+     sequence_lengths: Sequence[int],
+     sinks: torch.Tensor,
+     scale: float,
++    *,
++    shared_window: int = 0,
+ ) -> torch.Tensor:
+     # Keep the original logical token selection, including SWA and IndexPool.
+     # Each sink adds a logit to the denominator and has a zero value.
+@@ -68,8 +96,21 @@
+     for request, (request_end, sequence_length) in enumerate(
+         zip(query_ends, sequence_lengths, strict=True)
+     ):
++        request_queries = request_end - request_start
++        share = shared_window > 0 and request_queries > 1
++        if share:
++            first_query = sequence_length - request_queries
++            for start in range(request_start, request_end, QUERY_CHUNK):
++                end = min(start + QUERY_CHUNK, request_end)
++                output[start:end].copy_(_shared_swa_tile(
++                    query_latent[start:end], query_rope[start:end], flat_latent, flat_rope,
++                    block_tables[request], first_query + start - request_start, shared_window,
++                    block_size, sinks, scale,
++                ))
++            request_start = request_end
++            continue
+         padding = None
+-        if request_end - request_start > 1 and sequence_length > 1:
++        if request_queries > 1 and sequence_length > 1:
+             # Keep dummy reads in the request's initialized first page. Reading
+             # one shared slot for a whole tile serializes A3 GatherV3.
+             padding = torch.arange(
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -204,8 +204,29 @@
+     attention._value_projection = value.transpose(1, 2).contiguous()
+ 
+ 
++def _has_contiguous_logical_positions(context, metadata, positions):
++    ends = tuple(metadata.actual_seq_lengths_q)
++    lengths = tuple(metadata.seq_lens_list)
++    starts = (0, *ends[:-1])
++    intervals = tuple(end - begin for begin, end in zip(starts, ends, strict=True))
++    if all(count <= 1 for count in intervals):
++        return False
++    key = (ends, lengths, positions.data_ptr())
++    checked = context.additional_kwargs.setdefault("hy4_window_position_checks", {})
++    if key not in checked:
++        # Check once per forward so every SWA layer can use the same safe layout.
++        logical = [
++            index for length, count in zip(lengths, intervals, strict=True)
++            for index in range(length - count, length)
++        ]
++        expected = torch.tensor(logical, dtype=positions.dtype, device=positions.device)
++        checked[key] = torch.equal(positions, expected)
++    return checked[key]
++
++
+ def run_paged_sparse_attention(attention, hidden, q_c, positions, q, latent, rope, output):
+-    metadata_by_layer = get_forward_context().attn_metadata
++    context = get_forward_context()
++    metadata_by_layer = context.attn_metadata
+     if metadata_by_layer is None:
+         output.zero_()
+         return
+@@ -216,8 +237,11 @@
+         return
+     # Text-only MRoPE supplies identical coordinates on each axis.
+     positions = positions[0, :tokens] if positions.ndim == 2 else positions[:tokens]
++    shared_window = 0
+     if attention.is_window_layer:
+         topk = _swa_indices(positions, attention.config.sliding_window)
++        if _has_contiguous_logical_positions(context, metadata, positions):
++            shared_window = attention.config.sliding_window
+     else:
+         topk = attention.indexer(hidden[:tokens], q_c[:tokens], positions)
+     kv_cache, rope_cache = attention.attn.kv_cache
+@@ -238,6 +262,7 @@
+             metadata.seq_lens_list,
+             attention.learnable_sink_param,
+             attention.scaling,
++            shared_window=shared_window,
+         )
+         value = torch.bmm(attended.transpose(0, 1), attention._value_projection).transpose(0, 1)
+         output[:tokens].copy_(value.flatten(1))

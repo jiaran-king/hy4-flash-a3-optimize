@@ -1,0 +1,78 @@
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -3,6 +3,7 @@
+ """Paged sparse attention with learned sinks using the A3 BF16 KV cache."""
+ 
+ from collections.abc import Sequence
++from functools import lru_cache
+ 
+ import torch
+ 
+@@ -40,30 +41,26 @@
+     return torch.bmm(weights, vectors)
+ 
+ 
+-def _shared_swa_tile(
+-    query_latent, query_rope, flat_latent, flat_rope, block_table,
+-    first_query, window, block_size, sinks, scale,
+-):
++def _shared_swa_tile(query_latent, query_rope, latent, rope, offset, window, sinks, scale):
+     queries, heads, dimension = query_latent.shape
+-    first_key = max(0, first_query + 1 - window)
+-    key_positions = torch.arange(
+-        first_key, first_query + queries, device=query_latent.device, dtype=torch.long
+-    )
+-    blocks = block_table.index_select(0, key_positions // block_size).long()
+-    slots = blocks * block_size + key_positions % block_size
+-    latent = flat_latent.index_select(0, slots).float()
+-    rope = flat_rope.index_select(0, slots).float()
+     q_latent = query_latent.reshape(queries * heads, dimension).float()
+     q_rope = query_rope.reshape(queries * heads, query_rope.shape[-1]).float()
+     logits = (q_latent @ latent.T + q_rope @ rope.T).reshape(queries, heads, -1) * scale
+-    query_positions = first_query + torch.arange(queries, device=query_latent.device)
+-    valid = (key_positions <= query_positions[:, None]) & (
+-        key_positions > query_positions[:, None] - window
+-    )
++    valid = _swa_mask(queries, latent.shape[0], offset, window, query_latent.device)
+     logits.masked_fill_(~valid[:, None, :], -torch.inf)
+     sink = sinks.float().reshape(1, -1, 1).expand(queries, -1, 1)
+     weights = torch.cat((logits, sink), dim=-1).softmax(dim=-1)[..., :-1]
+     return (weights.reshape(queries * heads, -1) @ latent).reshape_as(query_latent)
++
++
++@lru_cache(maxsize=32)
++def _swa_mask(queries, keys, offset, window, device):
++    # The unpadded rectangle only depends on relative positions in this tile.
++    query_positions = offset + torch.arange(queries, device=device)
++    key_positions = torch.arange(keys, device=device)
++    return (key_positions <= query_positions[:, None]) & (
++        key_positions > query_positions[:, None] - window
++    )
+ 
+ 
+ def attend_paged_with_sink(
+@@ -116,12 +113,21 @@
+         share = shared_window > 0 and request_queries > 1
+         if share:
+             first_query = sequence_length - request_queries
++            first_key = max(0, first_query + 1 - shared_window)
++            position = torch.arange(first_key, sequence_length, device=query_latent.device)
++            block = block_tables[request].index_select(0, position // block_size).long()
++            slots = block * block_size + position % block_size
++            latent = flat_latent.index_select(0, slots).float()
++            rope = flat_rope.index_select(0, slots).float()
+             for start in range(request_start, request_end, QUERY_CHUNK):
+                 end = min(start + QUERY_CHUNK, request_end)
++                query = first_query + start - request_start
++                key = max(0, query + 1 - shared_window)
++                last = query + end - start - first_key
+                 output[start:end].copy_(_shared_swa_tile(
+-                    query_latent[start:end], query_rope[start:end], flat_latent, flat_rope,
+-                    block_tables[request], first_query + start - request_start, shared_window,
+-                    block_size, sinks, scale,
++                    query_latent[start:end], query_rope[start:end],
++                    latent[key - first_key:last], rope[key - first_key:last],
++                    query - key, shared_window, sinks, scale,
+                 ))
+             request_start = request_end
+             continue
