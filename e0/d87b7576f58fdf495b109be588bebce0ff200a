@@ -1,0 +1,21 @@
+patches/optimize/09-local-expert-decode/README.md
+  s_61b688964f46ae::t_641e63f6877c83 1-15
+patches/optimize/09-local-expert-decode/replicate-hy4-small-decode-moe-reduced.patch
+  s_61b688964f46ae::t_54c88687b7926b 1-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e0d87b7576f58fdf495b109be588bebce0ff200a",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
