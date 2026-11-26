@@ -1,0 +1,21 @@
+patches/optimize/03-ordered-indexpool/README.md
+  s_61b688964f46ae::t_4caa77fe97099d 1-15
+patches/optimize/03-ordered-indexpool/indexpool-order-and-tail.patch
+  s_61b688964f46ae::t_0b08bd7446397f 1-80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "20c5d78f2ceaba750007bca825fd09bedeaa83ca",
+  "prompts": {},
+  "sessions": {
+    "s_61b688964f46ae": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20bdf-5f96-7283-a8b5-f40ff0e15d79",
+        "model": "gpt-6.2-sol"
+      },
+      "human_author": "jiaran-king <jiaranran2@gmail.com>"
+    }
+  }
+}
