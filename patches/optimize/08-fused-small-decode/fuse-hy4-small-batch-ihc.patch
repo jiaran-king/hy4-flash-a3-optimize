@@ -1,0 +1,148 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+index bf66c8f..e802881 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+@@ -57,6 +57,7 @@ from vllm_ascend.models.hy_v4_flash_long import (
+     make_paged_cache,
+     run_paged_sparse_attention,
+ )
++from vllm_ascend.ops.triton.hy4_ihc_decode import decode_ihc_post, decode_ihc_pre, supports_decode_ihc
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
+ 
+@@ -389,6 +390,32 @@ class AscendFlashEngram(FlashEngram):
+             set_weight_attrs(projection.bias, {"weight_loader": self._load_bias})
+ 
+ 
++class AscendHYV4FlashHCLayer(HYV4HCLayer):
++    def __init__(self, config, layer_idx, prefix):
++        super().__init__(config, layer_idx, prefix=prefix)
++        self.use_a3_ihc = torch.npu.get_device_name().startswith("Ascend910_93")
++
++    def pre(self, hidden_states):
++        if not (self.use_a3_ihc and self.enable_ihc and self.hc_pre.hpc_op is None
++                and supports_decode_ihc(hidden_states)):
++            return super().pre(hidden_states)
++        pre = self.hc_pre
++        mixes = pre.hc_fn(hidden_states.flatten(1).float())[0].contiguous()
++        reduced, gates = decode_ihc_pre(hidden_states, mixes, pre.hc_scale, pre.hc_base,
++                                        pre.layernorm_epsilon, pre.hc_eps, pre.magnitude)
++        return reduced, gates, hidden_states
++
++    def post(self, output_with_bias, residual, post_gates):
++        if (self.use_a3_ihc and self.enable_ihc and self.hc_post.hpc_op is None
++                and supports_decode_ihc(residual) and post_gates is not None
++                and post_gates.dtype == torch.float32 and post_gates.is_contiguous()
++                and post_gates.shape == residual.shape[:2]
++                and output_with_bias.dtype == residual.dtype and output_with_bias.is_contiguous()
++                and output_with_bias.shape == (residual.shape[0], residual.shape[2])):
++            return decode_ihc_post(output_with_bias, residual, post_gates)
++        return super().post(output_with_bias, residual, post_gates)
++
++
+ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
+     def __init__(
+         self,
+@@ -420,8 +447,8 @@ class AscendHYV4FlashDecoderLayer(HYV4FlashDecoderLayer):
+         mlp_cls = HYV4FlashFeedForward if dense else HYV4FlashMoE
+         self.mlp = mlp_cls(config, quant_config, f"{prefix}.mlp")
+         self.block_type = "feedforward" if dense else "moe"
+-        self.hc_attn_layer = HYV4HCLayer(config, self.layer_idx, prefix=f"{prefix}.hc_attn_layer")
+-        self.hc_mlp_layer = HYV4HCLayer(config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer")
++        self.hc_attn_layer = AscendHYV4FlashHCLayer(config, self.layer_idx, prefix=f"{prefix}.hc_attn_layer")
++        self.hc_mlp_layer = AscendHYV4FlashHCLayer(config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer")
+ 
+ 
+ class AscendHYV4FlashModel(HYV4FlashModel):
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_decode.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_decode.py
+new file mode 100644
+index 0000000..42ee1e2
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_ihc_decode.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small-batch A3 iHC gate reduction and residual update."""
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def supports_decode_ihc(residual: torch.Tensor) -> bool:
++    return (
++        HAS_TRITON and residual.device.type == "npu" and residual.dtype == torch.bfloat16
++        and residual.ndim == 3 and residual.shape[1:] == (4, 3072)
++        and 0 < residual.shape[0] <= 16 and residual.is_contiguous()
++    )
++
++
++@triton.jit
++def _ihc_gates(
++    residual_ptr, mixes_ptr, scale_ptr, base_ptr, pre_ptr, post_ptr,
++    DIM: tl.constexpr, BLOCK: tl.constexpr, NORM_EPS: tl.constexpr,
++    GATE_EPS: tl.constexpr, MAGNITUDE: tl.constexpr,
++):
++    token = tl.program_id(0)
++    head = tl.arange(0, 4)
++    lane = tl.arange(0, BLOCK)
++    squared = tl.full((BLOCK,), 0, tl.float32)
++    for chunk in range(4 * DIM // BLOCK):
++        values = tl.load(residual_ptr + token * 4 * DIM + chunk * BLOCK + lane).to(tl.float32)
++        squared += values * values
++    mean_square = tl.sum(squared, axis=0) / (4 * DIM)
++    inv_rms = tl.rsqrt(mean_square + NORM_EPS)
++    pre_raw = tl.load(mixes_ptr + token * 8 + head) * inv_rms
++    post_raw = tl.load(mixes_ptr + token * 8 + 4 + head) * inv_rms
++    pre = tl.sigmoid(pre_raw * tl.load(scale_ptr) + tl.load(base_ptr + head)) + GATE_EPS
++    post = MAGNITUDE * tl.sigmoid(
++        post_raw * tl.load(scale_ptr + 1) + tl.load(base_ptr + 4 + head)
++    ) + GATE_EPS
++    tl.store(pre_ptr + token * 4 + head, pre)
++    tl.store(post_ptr + token * 4 + head, post)
++
++
++@triton.jit
++def _ihc_reduce_channels(residual_ptr, pre_ptr, reduced_ptr, DIM: tl.constexpr, BLOCK: tl.constexpr):
++    token = tl.program_id(0)
++    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    head = tl.arange(0, 4)
++    residual = tl.load(residual_ptr + (token * 4 + head[:, None]) * DIM + column[None, :],
++                       column[None, :] < DIM, 0).to(tl.float32)
++    pre = tl.load(pre_ptr + token * 4 + head)
++    reduced = tl.sum(residual * pre[:, None], axis=0)
++    tl.store(reduced_ptr + token * DIM + column, reduced, column < DIM)
++
++
++@triton.jit
++def _ihc_update_residual(output_ptr, residual_ptr, post_ptr, updated_ptr, DIM: tl.constexpr, BLOCK: tl.constexpr):
++    branch = tl.program_id(0)
++    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    output = tl.load(output_ptr + (branch // 4) * DIM + column, column < DIM, 0).to(tl.float32)
++    residual = tl.load(residual_ptr + branch * DIM + column, column < DIM, 0).to(tl.float32)
++    gate = tl.load(post_ptr + branch)
++    updated = (gate * output) + residual
++    tl.store(updated_ptr + branch * DIM + column, updated, column < DIM)
++
++
++def decode_ihc_pre(residual, mixes, scale, base, norm_eps, gate_eps, magnitude):
++    tokens, _, dim = residual.shape
++    reduced = residual.new_empty((tokens, dim))
++    pre = mixes.new_empty((tokens, 4))
++    post = mixes.new_empty((tokens, 4))
++    _ihc_gates[(tokens,)](
++        residual, mixes, scale, base, pre, post, dim, 4096, norm_eps, gate_eps, magnitude,
++        num_warps=4, enable_fp_fusion=False,
++    )
++    block = 512
++    _ihc_reduce_channels[(tokens, triton.cdiv(dim, block))](
++        residual, pre, reduced, dim, block, num_warps=4, enable_fp_fusion=False,
++    )
++    return reduced, post
++
++
++def decode_ihc_post(output, residual, post):
++    tokens, branches, dim = residual.shape
++    updated = torch.empty_like(residual)
++    block = 512
++    _ihc_update_residual[(tokens * branches, triton.cdiv(dim, block))](
++        output, residual, post, updated, dim, block, num_warps=4, enable_fp_fusion=False,
++    )
++    return updated

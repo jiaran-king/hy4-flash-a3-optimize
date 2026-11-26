@@ -1,0 +1,107 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index 3212ba1..07fc857 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -90,6 +90,42 @@ def _swa_indices(positions, window):
+     return recent.masked_fill(recent > positions[:, None], -1).int()
+ 
+ 
++def _shared_swa_indices(context, positions, window):
++    cache = context.additional_kwargs.setdefault("hy4_swa_selection", {})
++    key = (positions.data_ptr(), positions.shape, positions.stride(), window)
++    if key not in cache:
++        cache[key] = _swa_indices(positions, window)
++    return cache[key]
++
++
++def _completed_group_coordinates(block_tables, ranges, ratio, raw_page_size, pool_page_size):
++    owners = []
++    group_ids = []
++    for request, _, _, context, length in ranges:
++        first, end = context // ratio, length // ratio
++        group_ids.extend(range(first, end))
++        owners.extend([request] * (end - first))
++    if not group_ids:
++        return None
++    owners = torch.tensor(owners, device=block_tables.device)
++    group_ids = torch.tensor(group_ids, device=block_tables.device)
++    # Match the IndexPool anchor at each group's first token.
++    starts = group_ids * ratio
++    tokens = starts[:, None] + torch.arange(ratio, device=block_tables.device)
++    raw_pages = block_tables[owners[:, None], tokens // raw_page_size].long()
++    pool_pages = block_tables[owners, group_ids // pool_page_size].long()
++    return starts, raw_pages, tokens % raw_page_size, pool_pages, group_ids % pool_page_size
++
++
++def _shared_completed_groups(context, block_tables, ranges, ratio, raw_page_size, pool_page_size):
++    cache = context.additional_kwargs.setdefault("hy4_indexpool_write_coordinates", {})
++    key = (block_tables.data_ptr(), block_tables.shape, block_tables.stride(),
++           tuple(ranges), ratio, raw_page_size, pool_page_size)
++    if key not in cache:
++        cache[key] = _completed_group_coordinates(block_tables, ranges, ratio, raw_page_size, pool_page_size)
++    return cache[key]
++
++
+ class AscendHYV4FlashIndexPool(nn.Module):
+     """Use trained HY4 pooling parameters with request-scoped paged buffers."""
+ 
+@@ -125,23 +161,14 @@ class AscendHYV4FlashIndexPool(nn.Module):
+         self.intra_group_ape = nn.Parameter(torch.empty(self.ratio, INDEX_DIM, dtype=torch.float32))
+         self.cache = make_paged_cache(vllm_config, f"{prefix}.paged_keys", INDEX_DIM, INDEX_DIM)
+ 
+-    def _write_completed_groups(self, raw_cache, pool_cache, block_tables, ranges, device):
+-        owners = []
+-        group_ids = []
+-        for request, _, _, context, length in ranges:
+-            first, end = context // self.ratio, length // self.ratio
+-            group_ids.extend(range(first, end))
+-            owners.extend([request] * (end - first))
+-        if not group_ids:
++    def _write_completed_groups(self, context, raw_cache, pool_cache, block_tables, ranges):
++        coordinates = _shared_completed_groups(
++            context, block_tables, ranges, self.ratio, raw_cache.shape[1], pool_cache.shape[1],
++        )
++        if coordinates is None:
+             return
+-        owners = torch.tensor(owners, device=device)
+-        group_ids = torch.tensor(group_ids, device=device)
+-        # The CUDA implementation anchors each group at its first token.
+-        starts = group_ids * self.ratio
+-        group_tokens = starts[:, None] + torch.arange(self.ratio, device=device)
+-        block_size = raw_cache.shape[1]
+-        raw_blocks = block_tables[owners[:, None], group_tokens // block_size].long()
+-        raw = raw_cache[raw_blocks, group_tokens % block_size, 0].float()
++        starts, raw_pages, raw_offsets, pool_pages, pool_offsets = coordinates
++        raw = raw_cache[raw_pages, raw_offsets, 0].float()
+         pooled = gated_pool(
+             self.key_value_projection(raw),
+             self.key_gate_projection(raw),
+@@ -152,9 +179,7 @@ class AscendHYV4FlashIndexPool(nn.Module):
+         pooled = _quantized_vectors(
+             rotate_indexer(pooled, starts, self.rope_dim, self.rope_parameters), self.use_a3_quant,
+         )
+-        block_size = pool_cache.shape[1]
+-        blocks = block_tables[owners, group_ids // block_size].long()
+-        pool_cache[blocks, group_ids % block_size, 0] = pooled
++        pool_cache[pool_pages, pool_offsets, 0] = pooled
+ 
+     def _select_indices(self, query, weights, keys, positions):
+         if query.shape[0] > _SCORE_CHUNK_SIZE:
+@@ -191,7 +216,7 @@ class AscendHYV4FlashIndexPool(nn.Module):
+                 ranges.append((request, start, end, length - (end - start), length))
+             start = end
+         block_tables = metadata.block_tables
+-        self._write_completed_groups(raw_cache, pool_cache, block_tables, ranges, q_c.device)
++        self._write_completed_groups(context, raw_cache, pool_cache, block_tables, ranges)
+         width = (self.group_budget + 1) * self.ratio
+         if max(metadata.seq_lens_list) <= width:
+             # Every history group and the incomplete tail fit in this route.
+@@ -270,7 +295,7 @@ def run_paged_sparse_attention(attention, hidden, q_c, positions, q, latent, rop
+     shared_window = 0
+     native_sparse = False
+     if attention.is_window_layer:
+-        topk = _swa_indices(positions, attention.config.sliding_window)
++        topk = _shared_swa_indices(context, positions, attention.config.sliding_window)
+         if _has_contiguous_logical_positions(context, metadata, positions):
+             shared_window = attention.config.sliding_window
+             native_sparse = True

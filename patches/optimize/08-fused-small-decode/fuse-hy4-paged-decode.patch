@@ -1,0 +1,240 @@
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+index e802881..e8e2814 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash.py
+@@ -166,6 +166,7 @@ class AscendHYV4FlashAttentionBackend(AscendAttentionBackend):
+ class AscendHYV4FlashAttention(HYV4FlashAttention):
+     def __init__(self, vllm_config, config, layer_idx, _topk_indices_buffer, prefix):
+         nn.Module.__init__(self)
++        self.use_a3_paged_decode = torch.npu.get_device_name().startswith("Ascend910_93")
+         self.is_window_layer = config.layer_types[layer_idx] == SLIDING_ATTENTION
+         self.config = deepcopy(config)
+         self.config.rope_parameters = config.rope_for_layer(layer_idx)
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+index f8acc4a..82c5165 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_a3.py
+@@ -7,6 +7,8 @@ from functools import lru_cache
+ 
+ import torch
+ 
++from vllm_ascend.ops.triton.hy4_paged_decode import paged_decode_attention, supports_paged_decode
++
+ 
+ QUERY_CHUNK = 128
+ 
+@@ -99,6 +101,7 @@ def attend_paged_with_sink(
+     *,
+     shared_window: int = 0,
+     native_sparse: bool = False,
++    decode_lengths: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     # Keep the original logical token selection, including SWA and IndexPool.
+     # Each sink adds a logit to the denominator and has a zero value.
+@@ -117,18 +120,28 @@ def attend_paged_with_sink(
+     if singletons:
+         # The runner puts active decoders first in mixed steps. Gather each
+         # singleton from its own page table and run them as one attention batch.
+-        indexes = selected_tokens[:singletons].long()
+-        lengths = torch.tensor(
+-            sequence_lengths[:singletons], device=indexes.device, dtype=indexes.dtype
+-        )
+-        valid = (indexes >= 0) & (indexes < lengths[:, None])
+-        indexes = indexes.masked_fill(~valid, 0)
+-        blocks = block_tables[:singletons].gather(1, indexes // block_size)
+-        slots = blocks.long() * block_size + indexes % block_size
+-        attended = _attend_slots(
+-            query_latent[:singletons], query_rope[:singletons],
+-            flat_latent, flat_rope, slots, valid, sinks, scale,
+-        )
++        query = query_latent[:singletons]
++        rotation = query_rope[:singletons]
++        selected = selected_tokens[:singletons]
++        if (supports_paged_decode(query, rotation, latent_cache, rope_cache, selected,
++                                  block_tables, decode_lengths, sinks)
++                and max(sequence_lengths[:singletons]) <= block_tables.shape[-1] * block_size):
++            attended = paged_decode_attention(
++                query, rotation, latent_cache, rope_cache, selected, block_tables, decode_lengths, sinks, scale,
++            )
++        else:
++            indexes = selected_tokens[:singletons].long()
++            lengths = torch.tensor(
++                sequence_lengths[:singletons], device=indexes.device, dtype=indexes.dtype
++            )
++            valid = (indexes >= 0) & (indexes < lengths[:, None])
++            indexes = indexes.masked_fill(~valid, 0)
++            blocks = block_tables[:singletons].gather(1, indexes // block_size)
++            slots = blocks.long() * block_size + indexes % block_size
++            attended = _attend_slots(
++                query_latent[:singletons], query_rope[:singletons],
++                flat_latent, flat_rope, slots, valid, sinks, scale,
++            )
+         if singletons == query_latent.shape[0]:
+             return attended.to(query_latent.dtype)
+     output = torch.empty_like(query_latent)
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+index 0c7d677..3212ba1 100644
+--- a/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/models/hy_v4_flash_long.py
+@@ -29,6 +29,7 @@ from vllm_ascend.models.hy_v4_flash_a3_indexpool import (
+     select_prefill_groups,
+ )
+ from vllm_ascend.ops.triton.hy4_indexpool_quant import quantize_indexpool_rows, supports_indexpool_quant
++from vllm_ascend.ops.triton.hy4_paged_decode import supports_paged_kv_write, write_paged_decode_kv
+ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+ 
+ _SCORE_CHUNK_SIZE = 128
+@@ -279,8 +280,14 @@ def run_paged_sparse_attention(attention, hidden, q_c, positions, q, latent, rop
+     kv_cache, rope_cache = attention.attn.kv_cache
+     with attention_transfer_window():
+         slots = metadata.slot_mapping[:tokens].long()
+-        _write_cache_rows(kv_cache, slots, latent[:tokens])
+-        _write_cache_rows(rope_cache, slots, rope[:tokens, 0])
++        cache_latent, cache_rope = latent[:tokens], rope[:tokens, 0]
++        if attention.use_a3_paged_decode and supports_paged_kv_write(
++            cache_latent, cache_rope, kv_cache, rope_cache, slots,
++        ):
++            write_paged_decode_kv(cache_latent, cache_rope, kv_cache, rope_cache, slots)
++        else:
++            _write_cache_rows(kv_cache, slots, cache_latent)
++            _write_cache_rows(rope_cache, slots, cache_rope)
+         q_nope, q_rope = q[:tokens].split((attention.qk_nope_head_dim, attention.qk_rope_head_dim), dim=-1)
+         q_absorbed = torch.bmm(q_nope.transpose(0, 1), attention._key_projection).transpose(0, 1).contiguous()
+         attended = attend_paged_with_sink(
+@@ -296,6 +303,7 @@ def run_paged_sparse_attention(attention, hidden, q_c, positions, q, latent, rop
+             attention.scaling,
+             shared_window=shared_window,
+             native_sparse=native_sparse,
++            decode_lengths=metadata.seq_lens_gpu if attention.use_a3_paged_decode else None,
+         )
+         value = torch.bmm(attended.transpose(0, 1), attention._value_projection).transpose(0, 1)
+         output[:tokens].copy_(value.flatten(1))
+diff --git a/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_paged_decode.py b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_paged_decode.py
+new file mode 100644
+index 0000000..58e20ab
+--- /dev/null
++++ b/workspace/runtime-01/vllm-ascend/vllm_ascend/ops/triton/hy4_paged_decode.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++"""A3 paged-slot gathering and sink softmax for batched HY4 decode."""
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++
++def supports_paged_decode(
++    query, query_rope, latent_cache, rope_cache, selected, block_tables, lengths, sinks,
++):
++    return (
++        HAS_TRITON and query.device.type == "npu" and lengths is not None
++        and lengths.device == query.device and lengths.ndim == 1 and lengths.is_contiguous()
++        and lengths.shape[0] >= query.shape[0]
++        and query.dtype == query_rope.dtype == latent_cache.dtype == rope_cache.dtype == torch.bfloat16
++        and latent_cache.shape[-2:] == (1, 512) and rope_cache.shape[-2:] == (1, 64)
++        and latent_cache.is_contiguous() and rope_cache.is_contiguous()
++        and block_tables.stride(-1) == selected.stride(-1) == 1
++        and sinks.dtype == torch.float32 and sinks.is_contiguous()
++        and 1 < query.shape[0] <= 16 and 0 < selected.shape[-1] <= 2048
++    )
++
++
++@triton.jit
++def _gather_paged_inputs(
++    selected_ptr, tables_ptr, lengths_ptr, latent_ptr, rope_ptr, keys_ptr, rotated_ptr,
++    SELECTED_STRIDE: tl.constexpr, TABLE_STRIDE: tl.constexpr, TABLE_WIDTH: tl.constexpr,
++    PAGE: tl.constexpr, WIDTH: tl.constexpr, TILE: tl.constexpr,
++):
++    row = tl.program_id(0)
++    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
++    length = tl.load(lengths_ptr + row)
++    logical = tl.load(selected_ptr + row * SELECTED_STRIDE + column, column < WIDTH, -1)
++    valid = (logical >= 0) & (logical < length) & (logical // PAGE < TABLE_WIDTH)
++    page = tl.load(tables_ptr + row * TABLE_STRIDE + logical // PAGE, valid, 0).to(tl.int64)
++    slot = page * PAGE + logical % PAGE
++    vector = tl.arange(0, 512)
++    rotation = tl.arange(0, 64)
++    keys = tl.load(latent_ptr + slot[:, None] * 512 + vector[None, :], valid[:, None], 0)
++    rotated = tl.load(rope_ptr + slot[:, None] * 64 + rotation[None, :], valid[:, None], 0)
++    target = row * WIDTH + column
++    tl.store(keys_ptr + target[:, None] * 512 + vector[None, :], keys, column[:, None] < WIDTH)
++    tl.store(rotated_ptr + target[:, None] * 64 + rotation[None, :], rotated, column[:, None] < WIDTH)
++
++
++@triton.jit
++def _normalize_with_sink(
++    latent_ptr, rotary_ptr, selected_ptr, lengths_ptr, sink_ptr, weights_ptr,
++    HEADS: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr,
++    SELECTED_STRIDE: tl.constexpr, SCALE: tl.constexpr,
++):
++    head_row = tl.program_id(0)
++    row = head_row // HEADS
++    column = tl.arange(0, BLOCK)
++    length = tl.load(lengths_ptr + row)
++    logical = tl.load(selected_ptr + row * SELECTED_STRIDE + column, column < WIDTH, -1)
++    offset = head_row * WIDTH + column
++    key = tl.load(latent_ptr + offset, column < WIDTH, 0)
++    rotated = tl.load(rotary_ptr + offset, column < WIDTH, 0)
++    logits = tl.where((logical >= 0) & (logical < length), (key + rotated) * SCALE, -float("inf"))
++    sink = tl.load(sink_ptr + head_row % HEADS)
++    maximum = tl.maximum(tl.max(logits, axis=0), sink)
++    numerator = tl.exp(logits - maximum)
++    denominator = tl.sum(numerator, axis=0) + tl.exp(sink - maximum)
++    tl.store(weights_ptr + offset, numerator / denominator, column < WIDTH)
++
++
++def paged_decode_attention(query, query_rope, latent_cache, rope_cache, selected, block_tables, lengths, sinks, scale):
++    rows, heads, _ = query.shape
++    width = selected.shape[-1]
++    keys = torch.empty((rows, width, 512), device=query.device, dtype=torch.float32)
++    rotated = torch.empty((rows, width, 64), device=query.device, dtype=torch.float32)
++    tile = 8
++    _gather_paged_inputs[(rows, triton.cdiv(width, tile))](
++        selected, block_tables, lengths, latent_cache, rope_cache, keys, rotated,
++        selected.stride(0), block_tables.stride(0), block_tables.shape[1],
++        latent_cache.shape[1], width, tile, num_warps=4,
++    )
++    latent_logits = torch.bmm(query.float(), keys.transpose(1, 2))
++    rotary_logits = torch.bmm(query_rope.float(), rotated.transpose(1, 2))
++    weights = torch.empty_like(latent_logits)
++    _normalize_with_sink[(rows * heads,)](
++        latent_logits, rotary_logits, selected, lengths, sinks, weights,
++        heads, width, triton.next_power_of_2(width), selected.stride(0), scale,
++        num_warps=4, enable_fp_fusion=False,
++    )
++    return torch.bmm(weights, keys)
++
++
++def supports_paged_kv_write(latent, rope, latent_cache, rope_cache, slots):
++    return (
++        HAS_TRITON and latent.device.type == "npu"
++        and latent.dtype == rope.dtype == latent_cache.dtype == rope_cache.dtype == torch.bfloat16
++        and latent.shape == (slots.numel(), 512) and rope.shape == (slots.numel(), 64)
++        and latent.stride(-1) == rope.stride(-1) == 1 and slots.is_contiguous()
++        and latent_cache.shape[-2:] == (1, 512) and rope_cache.shape[-2:] == (1, 64)
++        and latent_cache.shape[:2] == rope_cache.shape[:2]
++        and latent_cache.is_contiguous() and rope_cache.is_contiguous() and 0 < slots.numel() <= 16
++    )
++
++
++@triton.jit
++def _write_decode_kv(
++    latent_ptr, rope_ptr, latent_cache_ptr, rope_cache_ptr, slots_ptr,
++    LATENT_STRIDE: tl.constexpr, ROPE_STRIDE: tl.constexpr, CACHE_SLOTS: tl.constexpr,
++):
++    row = tl.program_id(0)
++    slot = tl.load(slots_ptr + row).to(tl.int64)
++    vector = tl.arange(0, 512)
++    rotation = tl.arange(0, 64)
++    latent = tl.load(latent_ptr + row * LATENT_STRIDE + vector)
++    rope = tl.load(rope_ptr + row * ROPE_STRIDE + rotation)
++    valid = (slot >= 0) & (slot < CACHE_SLOTS)
++    tl.store(latent_cache_ptr + slot * 512 + vector, latent, valid)
++    tl.store(rope_cache_ptr + slot * 64 + rotation, rope, valid)
++
++
++def write_paged_decode_kv(latent, rope, latent_cache, rope_cache, slots):
++    _write_decode_kv[(slots.numel(),)](
++        latent, rope, latent_cache, rope_cache, slots,
++        latent.stride(0), rope.stride(0), latent_cache.shape[0] * latent_cache.shape[1],
++        num_warps=4,
++    )
